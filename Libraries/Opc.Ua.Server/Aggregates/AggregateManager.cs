@@ -129,7 +129,8 @@ namespace Opc.Ua.Server
                     m_defaultConfiguration = new AggregateConfiguration();
                     m_defaultConfiguration.PercentDataBad = 100;
                     m_defaultConfiguration.PercentDataGood = 100;
-                    m_defaultConfiguration.TreatUncertainAsBad = false;
+                    // OPC UA Part 13 specifies that uncertain values are treated as bad by default.
+                    m_defaultConfiguration.TreatUncertainAsBad = true;
                     m_defaultConfiguration.UseSlopedExtrapolation = false;
                     m_defaultConfiguration.UseServerCapabilitiesDefaults = false;
                 }
@@ -214,7 +215,7 @@ namespace Opc.Ua.Server
 
             if (m_server != null)
             {
-                m_server.DiagnosticsNodeManager.AddAggregateFunction(aggregateId, aggregateName, true);
+                m_server.DiagnosticsNodeManager?.AddAggregateFunction(aggregateId, aggregateName, true);
             }
         }
 

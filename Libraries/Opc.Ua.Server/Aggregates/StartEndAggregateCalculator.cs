@@ -230,8 +230,15 @@ namespace Opc.Ua.Server
 
             if (originalType != null && originalType.BuiltInType != BuiltInType.Double)
             {
-                object delta2 = TypeInfo.Cast(delta, TypeInfo.Scalars.Double, originalType.BuiltInType);
-                value.WrappedValue = new Variant(delta2, originalType);
+                // widen to the next larger signed type when the delta does not fit the
+                // source type (Part 13 §5.4.3.27 asks for the signed difference).
+                BuiltInType deltaType = GetDeltaType(originalType.BuiltInType, delta);
+                object delta2 = TypeInfo.Cast(delta, TypeInfo.Scalars.Double, deltaType);
+                value.WrappedValue = new Variant(
+                    delta2,
+                    deltaType == originalType.BuiltInType
+                        ? originalType
+                        : new TypeInfo(deltaType, ValueRanks.Scalar));
             }
             else
             {
@@ -306,8 +313,8 @@ namespace Opc.Ua.Server
             DataValue start = values[0];
             DataValue end = values[values.Count-1];
 
-            // check for bad bounds.
-            if (!IsGood(start) || !IsGood(end))
+            // Part 13 §5.4.3.30: Bad bounds return Bad_NoData.
+            if (StatusCode.IsBad(start.StatusCode) || StatusCode.IsBad(end.StatusCode))
             {
                 return GetNoDataValue(slice);
             }
@@ -347,7 +354,9 @@ namespace Opc.Ua.Server
             value.SourceTimestamp = GetTimestamp(slice);
             value.ServerTimestamp = GetTimestamp(slice);
 
-            if (!IsGood(start) || !IsGood(end))
+            // Part 13 §5.4.3.30: Uncertain bounds return Uncertain_DataSubNormal.
+            if (StatusCode.IsUncertain(start.StatusCode) ||
+                StatusCode.IsUncertain(end.StatusCode))
             {
                 value.StatusCode = StatusCodes.UncertainDataSubNormal;
             }
@@ -359,8 +368,15 @@ namespace Opc.Ua.Server
 
             if (originalType != null && originalType.BuiltInType != BuiltInType.Double)
             {
-                object delta2 = TypeInfo.Cast(delta, TypeInfo.Scalars.Double, originalType.BuiltInType);
-                value.WrappedValue = new Variant(delta2, originalType);
+                // widen to the next larger signed type when the delta does not fit the
+                // source type (Part 13 §5.4.3.27 asks for the signed difference).
+                BuiltInType deltaType = GetDeltaType(originalType.BuiltInType, delta);
+                object delta2 = TypeInfo.Cast(delta, TypeInfo.Scalars.Double, deltaType);
+                value.WrappedValue = new Variant(
+                    delta2,
+                    deltaType == originalType.BuiltInType
+                        ? originalType
+                        : new TypeInfo(deltaType, ValueRanks.Scalar));
             }
             else
             {
@@ -369,6 +385,39 @@ namespace Opc.Ua.Server
 
             // return result.
             return value;
+        }
+
+        /// <summary>
+        /// Returns the data type of a Delta/DeltaBounds result. Part 13
+        /// 5.4.3.27 asks for the source type but also for the signed difference;
+        /// a delta outside the range of the source type (a negative delta of an
+        /// unsigned source, or a signed delta that overflows) is widened to the
+        /// next larger signed type (Double for 64-bit sources) instead of failing
+        /// with Bad_TypeMismatch.
+        /// </summary>
+        private static BuiltInType GetDeltaType(BuiltInType sourceType, double delta)
+        {
+            switch (sourceType)
+            {
+                case BuiltInType.SByte:
+                    return delta < sbyte.MinValue || delta > sbyte.MaxValue ? BuiltInType.Int16 : sourceType;
+                case BuiltInType.Byte:
+                    return delta < byte.MinValue || delta > byte.MaxValue ? BuiltInType.Int16 : sourceType;
+                case BuiltInType.Int16:
+                    return delta < short.MinValue || delta > short.MaxValue ? BuiltInType.Int32 : sourceType;
+                case BuiltInType.UInt16:
+                    return delta < ushort.MinValue || delta > ushort.MaxValue ? BuiltInType.Int32 : sourceType;
+                case BuiltInType.Int32:
+                    return delta < int.MinValue || delta > int.MaxValue ? BuiltInType.Int64 : sourceType;
+                case BuiltInType.UInt32:
+                    return delta < uint.MinValue || delta > uint.MaxValue ? BuiltInType.Int64 : sourceType;
+                case BuiltInType.Int64:
+                    return delta < long.MinValue || delta >= long.MaxValue ? BuiltInType.Double : sourceType;
+                case BuiltInType.UInt64:
+                    return delta < ulong.MinValue || delta >= ulong.MaxValue ? BuiltInType.Double : sourceType;
+                default:
+                    return sourceType;
+            }
         }
         #endregion
     }

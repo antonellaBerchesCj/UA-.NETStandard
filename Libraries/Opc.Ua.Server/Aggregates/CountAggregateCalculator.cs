@@ -226,8 +226,13 @@ namespace Opc.Ua.Server
             DataValue value = new DataValue();
             value.WrappedValue = new Variant(duration, TypeInfo.Scalars.Double);
             value.SourceTimestamp = GetTimestamp(slice);
-            value.ServerTimestamp = GetTimestamp(slice);            
-            value.StatusCode = GetTimeBasedStatusCode(regions, value.StatusCode);
+            value.ServerTimestamp = GetTimestamp(slice);
+
+            // The duration uses stepped regions because a state lasts until the next value, but
+            // the status regions follow the interpolation of the variable: with sloped
+            // interpolation a region ending in a Bad or Uncertain value (including the simple
+            // end bound) is Uncertain (Part 13 §5.4.3.2.2).
+            value.StatusCode = GetTimeBasedStatusCode(slice, values, value.StatusCode);
             value.StatusCode = value.StatusCode.SetAggregateBits(AggregateBits.Calculated);
 
             // return result.
@@ -248,23 +253,12 @@ namespace Opc.Ua.Server
                 return GetNoDataValue(slice);
             }
 
-            // determine whether a transition occurs at the StartTime
-            double lastValue = Double.NaN;
-
-            if (slice.EarlyBound != null)
-            {
-                if (StatusCode.IsGood(slice.EarlyBound.Value.StatusCode))
-                {
-                    try
-                    {
-                        lastValue = CastToDouble(slice.EarlyBound.Value);
-                    }
-                    catch (Exception)
-                    {
-                        lastValue = Double.NaN;
-                    }
-                }
-            }
+            // The first non-Bad value is a transition when no previous non-Bad value exists.
+            // Part 13 §4.2.1.2: with TreatUncertainAsBad an Uncertain value is equivalent to Bad,
+            // so it is neither counted nor used as the previous value (IsGood applies the setting).
+            LinkedListNode<DataValue> previousValue = slice.EarlyBound;
+            bool hasLastValue = previousValue != null;
+            object lastValue = previousValue?.Value.Value;
 
             // count the transitions.
             int count = 0;
@@ -276,25 +270,14 @@ namespace Opc.Ua.Server
                     continue;
                 }
 
-                double nextValue = 0;
+                object nextValue = values[ii].Value;
 
-                try
+                if (!hasLastValue || !Utils.IsEqual(lastValue, nextValue))
                 {
-                    nextValue = CastToDouble(values[ii]);
-                }
-                catch (Exception)
-                {
-                    continue;
+                    count++;
                 }
 
-                if (!Double.IsNaN(lastValue))
-                {
-                    if (lastValue != nextValue)
-                    {
-                        count++;
-                    }
-                }
-
+                hasLastValue = true;
                 lastValue = nextValue;
             }
 

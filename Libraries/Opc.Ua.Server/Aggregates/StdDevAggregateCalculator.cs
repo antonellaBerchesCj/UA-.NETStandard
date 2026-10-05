@@ -74,6 +74,8 @@ namespace Opc.Ua.Server
             {
                 switch (id.Value)
                 {
+                    // valueType == 1: StandardDeviation, valueType == 2: Variance
+                    // includeBounds == true: sample, includeBounds == false: population
                     case Objects.AggregateFunction_StandardDeviationPopulation:
                     {
                         return ComputeStdDev(slice, false, 1);
@@ -81,12 +83,12 @@ namespace Opc.Ua.Server
 
                     case Objects.AggregateFunction_StandardDeviationSample:
                     {
-                        return ComputeStdDev(slice, false, 2);
+                        return ComputeStdDev(slice, true, 1);
                     }
 
                     case Objects.AggregateFunction_VariancePopulation:
                     {
-                        return ComputeStdDev(slice, true, 1);
+                        return ComputeStdDev(slice, false, 2);
                     }
 
                     case Objects.AggregateFunction_VarianceSample:
@@ -227,21 +229,12 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Calculates the StdDev, Variance, StdDev2 and Variance2 aggregates for the timeslice.
+        /// Calculates sample or population standard deviation/variance for the timeslice.
         /// </summary>
         protected DataValue ComputeStdDev(TimeSlice slice, bool includeBounds, int valueType)
         {
-            // get the values in the slice.
-            List<DataValue> values = null;
-
-            if (includeBounds)
-            {
-                values = GetValuesWithSimpleBounds(slice);
-            }
-            else
-            {
-                values = GetValues(slice);
-            }
+            // Part 13 defines these over good raw values in the interval, without bounds.
+            List<DataValue> values = GetValues(slice);
 
             // check for empty slice.
             if (values == null || values.Count == 0)
@@ -249,19 +242,24 @@ namespace Opc.Ua.Server
                 return GetNoDataValue(slice);
             }
 
-            // get the regions.
-            List<SubRegion> regions = GetRegionsInValueSet(values, false, true);
-
             List<double> xData = new List<double>();
-            double average = 0;
+            double sum = 0;
             bool nonGoodDataExists = false;
 
-            for (int ii = 0; ii < regions.Count; ii++)
+            for (int ii = 0; ii < values.Count; ii++)
             {
-                if (StatusCode.IsGood(regions[ii].StatusCode))
+                if (IsGood(values[ii]))
                 {
-                    xData.Add(regions[ii].StartValue);
-                    average += regions[ii].StartValue;
+                    try
+                    {
+                        double sample = CastToDouble(values[ii]);
+                        xData.Add(sample);
+                        sum += sample;
+                    }
+                    catch (Exception)
+                    {
+                        nonGoodDataExists = true;
+                    }
                 }
                 else
                 {
@@ -275,7 +273,7 @@ namespace Opc.Ua.Server
                 return GetNoDataValue(slice);
             }
 
-            average /= xData.Count;
+            double average = sum / xData.Count;
 
             // calculate variance.
             double variance = 0;
@@ -286,13 +284,21 @@ namespace Opc.Ua.Server
                 variance += error*error;
             }
 
-            // use the sample variance if bounds are included.
             if (includeBounds)
             {
-                variance /= (xData.Count + 1);
+                // Spec part 13 v105 section 5.4.3.37 and subsequent: the sample
+                // variance divides by n - 1.
+                if (xData.Count <= 1)
+                {
+                    variance = 0;
+                }
+                else
+                {
+                    variance /= xData.Count - 1;
+                }
             }
-            
-           // use the population variance if bounds are not included.
+
+            // use the population variance if bounds are not included.
             else
             {
                 variance /= xData.Count;

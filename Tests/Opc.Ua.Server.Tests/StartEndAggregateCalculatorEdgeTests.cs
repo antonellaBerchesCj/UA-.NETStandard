@@ -1,0 +1,520 @@
+/* ========================================================================
+ * Copyright (c) 2005-2026 The OPC Foundation, Inc. All rights reserved.
+ *
+ * OPC Foundation MIT License 1.00
+ *
+ * Permission is hereby granted, free of charge, to any person
+ * obtaining a copy of this software and associated documentation
+ * files (the "Software"), to deal in the Software without
+ * restriction, including without limitation the rights to use,
+ * copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ * OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * The complete license agreement can be found here:
+ * http://opcfoundation.org/License/MIT/1.00/
+ * ======================================================================*/
+
+using System;
+using System.Collections.Generic;
+using NUnit.Framework;
+
+namespace Opc.Ua.Server.Tests
+{
+    /// <summary>
+    /// Edge-case tests for <see cref="StartEndAggregateCalculator"/> covering bad-data handling,
+    /// empty slices, non-castable values and the base-class fall-through paths.
+    /// </summary>
+    [TestFixture]
+    [Category("Aggregators")]
+    [SetCulture("en-us")]
+    [SetUICulture("en-us")]
+    [Parallelizable]
+    public class StartEndAggregateCalculatorEdgeTests
+    {
+        private AggregateConfiguration m_configuration;
+
+        [SetUp]
+        public void SetUp()
+        {
+            m_configuration = new AggregateConfiguration
+            {
+                TreatUncertainAsBad = false,
+                PercentDataBad = 100,
+                PercentDataGood = 100,
+                UseSlopedExtrapolation = false
+            };
+        }
+
+        private static DataValue Value(double value, StatusCode status, DateTime timestamp)
+        {
+            return new DataValue(new Variant(value), status, timestamp, timestamp);
+        }
+
+        private static DataValue UnsignedValue(uint value, DateTime timestamp)
+        {
+            return new DataValue(new Variant(value), StatusCodes.Good, timestamp, timestamp);
+        }
+
+        private DataValue RunFirst(IAggregateCalculator calculator, IEnumerable<DataValue> values)
+        {
+            foreach (DataValue value in values)
+            {
+                calculator.QueueRawValue(value);
+            }
+
+            DataValue result = default;
+            bool any = false;
+            while (calculator.TryGetProcessedValue(true, out DataValue value))
+            {
+                if (!any)
+                {
+                    result = value;
+                    any = true;
+                }
+            }
+
+            return result;
+        }
+
+        private DataValue ComputeStandard(
+            NodeId aggregateId, List<DataValue> values, DateTime startTime, DateTime endTime, double interval)
+        {
+            IAggregateCalculator calculator = Aggregators.CreateStandardCalculator(
+                aggregateId, startTime, endTime, interval, false, m_configuration);
+            return RunFirst(calculator, values);
+        }
+
+        [Test]
+        public void DeltaWithLeadingBadDataMarksUncertain()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(1.0, StatusCodes.Bad, t0),
+                Value(10.0, StatusCodes.Good, t0.AddMilliseconds(2000)),
+                Value(20.0, StatusCodes.Good, t0.AddMilliseconds(4000)),
+                Value(30.0, StatusCodes.Good, t0.AddMilliseconds(6000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_Delta, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(20.0).Within(0.0001));
+        }
+
+        [Test]
+        public void DeltaWithAllBadDataReturnsNoData()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(6000);
+
+            var values = new List<DataValue>
+            {
+                Value(1.0, StatusCodes.Bad, t0),
+                Value(2.0, StatusCodes.Bad, t0.AddMilliseconds(2000)),
+                Value(3.0, StatusCodes.Bad, t0.AddMilliseconds(4000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_Delta, values, startTime, endTime, 6000);
+
+            Assert.That(StatusCode.IsBad(result.StatusCode), Is.True);
+        }
+
+        [Test]
+        public void DeltaBoundsWithBadBoundReturnsNoData()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(6000);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Bad, t0),
+                Value(20.0, StatusCodes.Bad, t0.AddMilliseconds(2000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_DeltaBounds, values, startTime, endTime, 6000);
+
+            Assert.That(StatusCode.IsBad(result.StatusCode), Is.True);
+        }
+
+        /// <summary>
+        /// Verifies that a decreasing unsigned counter produces a negative
+        /// delta in the next signed type (Part 13 5.4.3.27: the aggregate is
+        /// negative when the value decreases) and that later increasing
+        /// intervals keep the source type.
+        /// </summary>
+        [TestCase("Delta")]
+        [TestCase("DeltaBounds")]
+        public void UnsignedDecreaseReturnsNegativeSignedDeltaAndLaterTypedProgress(
+            string aggregateName)
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(2000);
+            NodeId aggregateId = aggregateName == "Delta"
+                ? ObjectIds.AggregateFunction_Delta
+                : ObjectIds.AggregateFunction_DeltaBounds;
+            var values = new List<DataValue>
+            {
+                UnsignedValue(10, startTime),
+                UnsignedValue(5, startTime.AddMilliseconds(900)),
+                UnsignedValue(5, startTime.AddMilliseconds(1000)),
+                UnsignedValue(15, startTime.AddMilliseconds(1900)),
+                UnsignedValue(15, endTime)
+            };
+
+            List<DataValue> results = RunAllStandard(
+                aggregateId,
+                values,
+                startTime,
+                endTime,
+                1000);
+
+            Assert.That(results, Has.Count.GreaterThanOrEqualTo(2));
+            Assert.That(StatusCode.IsGood(results[0].StatusCode), Is.True);
+            Assert.That(results[0].WrappedValue.TypeInfo.BuiltInType, Is.EqualTo(BuiltInType.Int64));
+            Assert.That(results[0].WrappedValue.TryGetValue(out long firstValue), Is.True);
+            Assert.That(firstValue, Is.EqualTo(-5L));
+            Assert.That(StatusCode.IsGood(results[1].StatusCode), Is.True);
+            Assert.That(results[1].WrappedValue.TypeInfo.BuiltInType, Is.EqualTo(BuiltInType.UInt32));
+            Assert.That(results[1].WrappedValue.TryGetValue(out uint laterValue), Is.True);
+            Assert.That(laterValue, Is.EqualTo(10U));
+        }
+
+        /// <summary>
+        /// Verifies that a signed delta outside the source type's range is widened
+        /// to the next signed type instead of failing with Bad_TypeMismatch.
+        /// </summary>
+        [TestCase("Delta")]
+        [TestCase("DeltaBounds")]
+        public void SignedDeltaOverflowIsWidenedToTheNextSignedType(string aggregateName)
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(1000);
+            NodeId aggregateId = aggregateName == "Delta"
+                ? ObjectIds.AggregateFunction_Delta
+                : ObjectIds.AggregateFunction_DeltaBounds;
+            var values = new List<DataValue>
+            {
+                new DataValue(new Variant((short)-20000), StatusCodes.Good, startTime, startTime),
+                new DataValue(new Variant((short)20000), StatusCodes.Good, startTime.AddMilliseconds(900), startTime.AddMilliseconds(900)),
+                new DataValue(new Variant((short)20000), StatusCodes.Good, endTime, endTime)
+            };
+
+            List<DataValue> results = RunAllStandard(
+                aggregateId,
+                values,
+                startTime,
+                endTime,
+                1000);
+
+            Assert.That(results, Has.Count.GreaterThanOrEqualTo(1));
+            Assert.That(StatusCode.IsBad(results[0].StatusCode), Is.False);
+            Assert.That(results[0].WrappedValue.TypeInfo.BuiltInType, Is.EqualTo(BuiltInType.Int32));
+            Assert.That(results[0].WrappedValue.TryGetValue(out int delta), Is.True);
+            Assert.That(delta, Is.EqualTo(40000));
+        }
+
+        /// <summary>
+        /// Verifies that DeltaBounds reports an Uncertain bound as Uncertain_DataSubNormal with
+        /// its value (Part 13 §5.4.3.30, Table 78), independent of the configuration.
+        /// </summary>
+        [Test]
+        public void DeltaBoundsWithUncertainEndBoundReturnsUncertainValue()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(1000);
+
+            // The end bound at 1 s is interpolated from the Uncertain value at 0.5 s and the
+            // Good value at 2 s, so it is Uncertain_DataSubNormal (§3.1.9).
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, startTime),
+                Value(20.0, StatusCodes.UncertainSubstituteValue, startTime.AddMilliseconds(500)),
+                Value(30.0, StatusCodes.Good, startTime.AddMilliseconds(2000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_DeltaBounds, values, startTime, endTime, 1000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
+            Assert.That(
+                result.WrappedValue.ConvertToDouble().GetDouble(),
+                Is.EqualTo(20.0 + (10.0 / 3.0) - 10.0).Within(0.0001));
+        }
+
+        [Test]
+        public void StartEndCalculatorWithUnhandledNumericIdFallsBackToBaseInterpolation()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            // Count is not a Start/End aggregate; the switch default falls back to base.ComputeValue.
+            var calculator = new StartEndAggregateCalculator(
+                ObjectIds.AggregateFunction_Count, startTime, endTime, 5000, false, m_configuration);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, startTime.AddMilliseconds(1000)),
+                Value(20.0, StatusCodes.Good, startTime.AddMilliseconds(6000))
+            };
+
+            DataValue result = RunFirst(calculator, values);
+
+            Assert.That(result, Is.Not.Null);
+        }
+
+        [Test]
+        public void StartEndCalculatorWithNonNumericIdFallsBackToBaseInterpolation()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            // A non-numeric aggregate id causes AggregateId.TryGetValue(out uint) to fail.
+            var calculator = new StartEndAggregateCalculator(
+                new NodeId("CustomAggregate", 1), startTime, endTime, 5000, false, m_configuration);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, startTime.AddMilliseconds(1000)),
+                Value(20.0, StatusCodes.Good, startTime.AddMilliseconds(6000))
+            };
+
+            DataValue fallbackResult = RunFirst(calculator, values);
+
+            Assert.That(fallbackResult, Is.Not.Null);
+        }
+
+        private List<DataValue> RunAll(IAggregateCalculator calculator, IEnumerable<DataValue> values)
+        {
+            foreach (DataValue value in values)
+            {
+                calculator.QueueRawValue(value);
+            }
+
+            var results = new List<DataValue>();
+            while (calculator.TryGetProcessedValue(true, out DataValue value))
+            {
+                results.Add(value);
+            }
+
+            return results;
+        }
+
+        private List<DataValue> RunAllStandard(
+            NodeId aggregateId, List<DataValue> values, DateTime startTime, DateTime endTime, double interval)
+        {
+            IAggregateCalculator calculator = Aggregators.CreateStandardCalculator(
+                aggregateId, startTime, endTime, interval, false, m_configuration);
+            return RunAll(calculator, values);
+        }
+
+        [Test]
+        public void StartAggregateReturnsFirstGoodValue()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, t0),
+                Value(20.0, StatusCodes.Good, t0.AddMilliseconds(2000)),
+                Value(30.0, StatusCodes.Good, t0.AddMilliseconds(4000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_Start, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(10.0).Within(0.0001));
+        }
+
+        [Test]
+        public void EndAggregateReturnsLastGoodValue()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, t0),
+                Value(20.0, StatusCodes.Good, t0.AddMilliseconds(2000)),
+                Value(30.0, StatusCodes.Good, t0.AddMilliseconds(4000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_End, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(30.0).Within(0.0001));
+        }
+
+        [Test]
+        public void DeltaAggregateComputesDifferenceForGoodData()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(5.0, StatusCodes.Good, t0),
+                Value(15.0, StatusCodes.Good, t0.AddMilliseconds(2000)),
+                Value(35.0, StatusCodes.Good, t0.AddMilliseconds(4000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_Delta, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(StatusCode.IsGood(result.StatusCode), Is.True);
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(30.0).Within(0.0001));
+        }
+
+        [Test]
+        public void StartAndEndAggregatesReturnNoDataForEmptySlices()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            // Values only in the first slice; trailing slices are empty and must return NoData.
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, startTime.AddMilliseconds(200)),
+                Value(20.0, StatusCodes.Good, startTime.AddMilliseconds(400))
+            };
+
+            List<DataValue> startResults = RunAllStandard(
+                ObjectIds.AggregateFunction_Start, values, startTime, endTime, 2000);
+            List<DataValue> deltaResults = RunAllStandard(
+                ObjectIds.AggregateFunction_Delta, values, startTime, endTime, 2000);
+
+            Assert.That(startResults.Exists(r => StatusCode.IsBad(r.StatusCode)), Is.True);
+            Assert.That(deltaResults.Exists(r => StatusCode.IsBad(r.StatusCode)), Is.True);
+        }
+
+        [Test]
+        public void DeltaWithNonNumericGoodValueReturnsNoData()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime t0 = startTime.AddMilliseconds(500);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                new DataValue(new Variant("not-a-number"), StatusCodes.Good, t0, t0),
+                new DataValue(
+                    new Variant("also-bad"),
+                    StatusCodes.Good,
+                    t0.AddMilliseconds(2000),
+                    t0.AddMilliseconds(2000))
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_Delta, values, startTime, endTime, 10000);
+
+            Assert.That(StatusCode.IsBad(result.StatusCode), Is.True);
+        }
+
+        [Test]
+        public void StartBoundAggregateReturnsStartValue()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, startTime),
+                Value(20.0, StatusCodes.Good, startTime.AddMilliseconds(5000)),
+                Value(30.0, StatusCodes.Good, endTime)
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_StartBound, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+        }
+
+        [Test]
+        public void EndBoundAggregateReturnsCalculatedEndValue()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(10.0, StatusCodes.Good, startTime),
+                Value(20.0, StatusCodes.Good, startTime.AddMilliseconds(5000)),
+                Value(30.0, StatusCodes.Good, endTime)
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_EndBound, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.StatusCode.AggregateBits.HasFlag(AggregateBits.Calculated), Is.True);
+        }
+
+        [Test]
+        public void DeltaBoundsAggregateComputesDifference()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(10000);
+
+            var values = new List<DataValue>
+            {
+                Value(5.0, StatusCodes.Good, startTime),
+                Value(15.0, StatusCodes.Good, startTime.AddMilliseconds(5000)),
+                Value(25.0, StatusCodes.Good, endTime)
+            };
+
+            DataValue result = ComputeStandard(
+                ObjectIds.AggregateFunction_DeltaBounds, values, startTime, endTime, 10000);
+
+            Assert.That(result, Is.Not.Null);
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(20.0).Within(0.0001));
+        }
+
+        [Test]
+        public void BoundAggregatesReturnNoDataForEmptySlices()
+        {
+            var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
+            DateTime endTime = startTime.AddMilliseconds(4000);
+
+            // No raw values at all: every bound slice must return NoData.
+            var values = new List<DataValue>();
+
+            List<DataValue> startBound = RunAllStandard(
+                ObjectIds.AggregateFunction_StartBound, values, startTime, endTime, 2000);
+            List<DataValue> deltaBounds = RunAllStandard(
+                ObjectIds.AggregateFunction_DeltaBounds, values, startTime, endTime, 2000);
+
+            Assert.That(startBound.TrueForAll(r => StatusCode.IsNotGood(r.StatusCode)), Is.True);
+            Assert.That(deltaBounds.TrueForAll(r => StatusCode.IsNotGood(r.StatusCode)), Is.True);
+        }
+    }
+}

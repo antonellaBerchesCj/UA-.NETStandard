@@ -128,6 +128,17 @@ namespace Opc.Ua.Server
             // get the regions.
             List<SubRegion> regions = GetRegionsInValueSet(values, false, true);
 
+            // Part 13 §5.4.3.31/32: the status of the first region is the status of the raw
+            // value at or before the start of the interval (Bad if there is none), not the
+            // status of the interpolated simple bound.
+            if (regions.Count > 0)
+            {
+                DataValue firstPoint;
+                regions[0].StatusCode = TryGetRawValueAtOrBefore(slice.StartTime, out firstPoint)
+                    ? firstPoint.StatusCode
+                    : (StatusCode)StatusCodes.BadNoData;
+            }
+
             double duration = 0;
             double total = 0;
 
@@ -137,14 +148,18 @@ namespace Opc.Ua.Server
 
                 if (isBad)
                 {
-                    if (StatusCode.IsBad(regions[ii].StatusCode))
+                    if (StatusCode.IsBad(regions[ii].StatusCode) ||
+                        (Configuration.TreatUncertainAsBad &&
+                            StatusCode.IsUncertain(regions[ii].StatusCode)))
                     {
                         duration += regions[ii].Duration;
                     }
                 }
                 else
                 {
-                    if (StatusCode.IsGood(regions[ii].StatusCode))
+                    if (StatusCode.IsGood(regions[ii].StatusCode) ||
+                        (!Configuration.TreatUncertainAsBad &&
+                            StatusCode.IsUncertain(regions[ii].StatusCode)))
                     {
                         duration += regions[ii].Duration;
                     }
@@ -160,7 +175,7 @@ namespace Opc.Ua.Server
             DataValue value = new DataValue();
             value.WrappedValue = new Variant(duration, TypeInfo.Scalars.Double);
             value.SourceTimestamp = GetTimestamp(slice);
-            value.ServerTimestamp = GetTimestamp(slice);            
+            value.ServerTimestamp = GetTimestamp(slice);
             value.StatusCode = value.StatusCode.SetAggregateBits(AggregateBits.Calculated);
 
             // return result.
@@ -168,20 +183,26 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Calculates the DurationGood and DurationBad aggregates for the timeslice.
+        /// Calculates the WorstQuality and WorstQuality2 aggregates for the timeslice.
         /// </summary>
         protected DataValue ComputeWorstQuality(TimeSlice slice, bool includeBounds)
         {
             // get the values in the slice.
-            List<DataValue> values = null;
-            
-            if (!includeBounds)
+            List<DataValue> values = GetValues(slice);
+
+            // Part 13 §5.4.2.2: a backward interval is calculated like the forward interval
+            // covering the same time range, so the start bound is always taken at the early
+            // time of the slice and the values are evaluated in chronological order.
+            if (includeBounds && values != null)
             {
-                values = GetValues(slice);
-            }
-            else
-            {
-                values = GetValuesWithSimpleBounds(slice);
+                DateTime startTime = slice.StartTime;
+                DataValue startBound = GetSimpleBound(startTime, slice);
+
+                if (startBound != null &&
+                    (values.Count == 0 || values[0].SourceTimestamp != startTime))
+                {
+                    values.Insert(0, startBound);
+                }
             }
 
             // check for empty slice.
@@ -191,11 +212,12 @@ namespace Opc.Ua.Server
             }
 
             // get the regions.
-            List<SubRegion> regions = GetRegionsInValueSet(values, false, true);
+            _ = GetRegionsInValueSet(values, false, true);
 
-            StatusCode worstQuality = StatusCodes.Good;
+            StatusCode worstQuality = values[0].StatusCode.CodeBits;
             int badQualityCount = 0;
             int uncertainQualityCount = 0;
+            int goodQualityCount = 0;
 
             for (int ii = 0; ii < values.Count; ii++)
             {
@@ -221,8 +243,10 @@ namespace Opc.Ua.Server
                     {
                         worstQuality = quality.CodeBits;
                     }
-
-                    continue;
+                }
+                else
+                {
+                    goodQualityCount++;
                 }
             }
 
@@ -233,7 +257,9 @@ namespace Opc.Ua.Server
             value.ServerTimestamp = GetTimestamp(slice);
             value.StatusCode = value.StatusCode.SetAggregateBits(AggregateBits.Calculated);
 
-            if ((StatusCode.IsBad(worstQuality) && badQualityCount > 1) || (StatusCode.IsUncertain(worstQuality) && uncertainQualityCount > 1))
+            if ((StatusCode.IsBad(worstQuality) && badQualityCount > 1) ||
+                (StatusCode.IsUncertain(worstQuality) && uncertainQualityCount > 1) ||
+                (StatusCode.IsGood(worstQuality) && goodQualityCount > 1))
             {
                 value.StatusCode = value.StatusCode.SetAggregateBits(value.StatusCode.AggregateBits | AggregateBits.MultipleValues);
             }
