@@ -110,7 +110,7 @@ namespace Opc.Ua.Server
                 return values[0];
             }
 
-            return values[^1];
+            return values[values.Count - 1];
         }
 
         /// <summary>
@@ -201,18 +201,7 @@ namespace Opc.Ua.Server
             // calculate delta.
             double delta = endValue - startValue;
 
-            if (originalType != null && originalType.BuiltInType != BuiltInType.Double)
-            {
-                object delta2 = TypeInfo.Cast(
-                    delta,
-                    TypeInfo.Scalars.Double,
-                    originalType.BuiltInType);
-                value.WrappedValue = new Variant(delta2, originalType);
-            }
-            else
-            {
-                value.WrappedValue = new Variant(delta, TypeInfo.Scalars.Double);
-            }
+            value.WrappedValue = CreateDeltaValue(delta, originalType);
 
             // return result.
             return value;
@@ -242,10 +231,16 @@ namespace Opc.Ua.Server
             // return end bound.
             else
             {
-                value = values[^1];
+                value = values[values.Count - 1];
             }
 
-            if (!IsGood(value))
+            // The interpolated bound is a Double. StartBound/EndBound return it in the source type,
+            // rounded half up for integer types (OPC 10000-4 §7.7.3; CTT 1.05.513 on HistorianInt1, Mantis 11494).
+            value = ConvertToSourceType(value, slice);
+
+            // Part 13 Tables 76/77: a Bad bound is Bad_NoData, an Uncertain bound keeps its
+            // status; TreatUncertainAsBad does not apply to bounds (Mantis 11462).
+            if (!IsBoundCandidate(value))
             {
                 value.StatusCode = StatusCodes.BadNoData;
             }
@@ -265,43 +260,95 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
+        /// Converts a Double value to the source Integer type, rounding half up.
+        /// </summary>
+        private DataValue ConvertToSourceType(DataValue value, TimeSlice slice)
+        {
+            if (StatusCode.IsBad(value.StatusCode) || value.WrappedValue.TypeInfo?.BuiltInType != BuiltInType.Double)
+            {
+                return value; // exact match/raw/stepped
+            }
+
+            // the source type is taken from a raw value from the slice
+            LinkedListNode<DataValue> raw = slice.EarlyBound ?? slice.Begin ?? slice.LateBound;
+
+            if (raw == null)
+            {
+                return value;
+            }
+
+            TypeInfo sourceType = GetSourceType(slice);
+
+            if (sourceType == null)
+            {
+                return value;
+            }
+
+            // non-numeric (Boolean, String) cannot be SlopedInterpolated  --> BadNoData
+            if (!TypeInfo.IsNumericType(sourceType.BuiltInType))
+            {
+                return GetNoDataValue(value.SourceTimestamp);
+            }
+
+            if (!IsIntegerType(sourceType.BuiltInType))
+            {
+                return value; // Double/Float remains at it is
+            }
+
+            object castValue = TypeInfo.Cast(RoundHalfUp(CastToDouble(value)), TypeInfo.Scalars.Double, sourceType.BuiltInType);
+
+            return new DataValue(new Variant(castValue, sourceType), value.StatusCode, value.SourceTimestamp, value.ServerTimestamp);
+        }
+
+
+        private static TypeInfo GetSourceType(TimeSlice slice)
+        {
+            LinkedListNode<DataValue> node = slice.EarlyBound ?? slice.Begin ?? slice.LateBound;
+
+            if (node?.List == null)
+            {
+                return null;
+            }
+
+            // first real raw value (jump over the BadBoundNotFound placeholders with Value = null)
+            foreach (DataValue dv in node.List)
+            {
+                if (dv.Value != null && StatusCode.IsNotBad(dv.StatusCode))
+                {
+                    return dv.WrappedValue.TypeInfo;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
         /// Calculates the Delta2 aggregate for the timeslice.
         /// </summary>
         protected DataValue ComputeDelta2(TimeSlice slice)
         {
-            // get the values in the slice.
-            List<DataValue> values = GetValuesWithSimpleBounds(slice);
+            // Unrounded double bounds calculated via interpolation (no more from GetValuesWithSimpleBounds rounded list).
+            DataValue start = GetSimpleBound(slice.StartTime, slice, useOriginalType: false);
+            DataValue end = GetSimpleBound(slice.EndTime, slice, useOriginalType: false);
 
-            // check for empty slice.
-            if (values == null || values.Count == 0)
+            // only a Bad bound gives Bad_NoData; TreatUncertainAsBad does not apply to bounds and
+            // an Uncertain bound makes the result Uncertain_DataSubNormal (Mantis 11462).
+            if (!IsBoundCandidate(start) || !IsBoundCandidate(end))
             {
                 return GetNoDataValue(slice);
             }
 
-            DataValue start = values[0];
-            DataValue end = values[^1];
-
-            // check for bad bounds.
-            if (!IsGood(start) || !IsGood(end))
-            {
-                return GetNoDataValue(slice);
-            }
-
-            TypeInfo originalType = default;
-
-            // convert to doubles.
-            double startValue;
+            // convert to double
+            double startValue, endValue;
             try
             {
                 startValue = CastToDouble(start);
-                originalType = start.WrappedValue.TypeInfo;
             }
             catch (Exception)
             {
                 startValue = double.NaN;
             }
 
-            double endValue;
             try
             {
                 endValue = CastToDouble(end);
@@ -323,31 +370,87 @@ namespace Opc.Ua.Server
                 ServerTimestamp = GetTimestamp(slice)
             };
 
-            if (!IsGood(start) || !IsGood(end))
+            if (StatusCode.IsUncertain(start.StatusCode) ||
+                StatusCode.IsUncertain(end.StatusCode))
             {
                 value.StatusCode = StatusCodes.UncertainDataSubNormal;
             }
 
             value.StatusCode = value.StatusCode.SetAggregateBits(AggregateBits.Calculated);
 
-            // calculate delta.
-            double delta = endValue - startValue;
+            TypeInfo originalType = RawDataType ?? start.WrappedValue.TypeInfo;
 
-            if (originalType != null && originalType.BuiltInType != BuiltInType.Double)
+            // convert every bound to an integer type, then subtract
+            // - integer types: round each bound half up (OPC 10000-4 §7.7.3, Mantis 11494) before subtraction
+            // - double: keep the exact value
+            double delta;
+            if (originalType != null && IsIntegerType(originalType.BuiltInType))
             {
-                object delta2 = TypeInfo.Cast(
-                    delta,
-                    TypeInfo.Scalars.Double,
-                    originalType.BuiltInType);
-                value.WrappedValue = new Variant(delta2, originalType);
+                delta = RoundHalfUp(endValue) - RoundHalfUp(startValue);
             }
             else
             {
-                value.WrappedValue = new Variant(delta, TypeInfo.Scalars.Double);
+                delta = endValue - startValue;
             }
+
+            value.WrappedValue = CreateDeltaValue(delta, originalType);
 
             // return result.
             return value;
+        }
+
+        /// <summary>
+        /// Returns the Delta/DeltaBounds result in the data type of the raw values (Part 13
+        /// Tables 74 and 78). A delta that does not fit into that type (a decrease of an unsigned
+        /// value, or a signed overflow) is widened to the next larger signed type, and to Double
+        /// beyond Int64/UInt64.
+        /// </summary>
+        private static Variant CreateDeltaValue(double delta, TypeInfo originalType)
+        {
+            if (originalType == null ||
+                originalType.ValueRank >= 0 ||
+                !TypeInfo.IsNumericType(originalType.BuiltInType) ||
+                originalType.BuiltInType == BuiltInType.Double)
+            {
+                return new Variant(delta, TypeInfo.Scalars.Double);
+            }
+
+            BuiltInType target = GetDeltaType(originalType.BuiltInType, delta);
+
+            if (target == BuiltInType.Double)
+            {
+                return new Variant(delta, TypeInfo.Scalars.Double);
+            }
+
+            object converted = TypeInfo.Cast(delta, TypeInfo.Scalars.Double, target);
+            return new Variant(converted, new TypeInfo(target, ValueRanks.Scalar));
+        }
+
+        /// <summary>
+        /// Returns the type that can hold the delta: the source type if it fits, otherwise the
+        /// next larger signed type.
+        /// </summary>
+        private static BuiltInType GetDeltaType(BuiltInType sourceType, double delta)
+        {
+            if (FitsInType(delta, sourceType))
+            {
+                return sourceType;
+            }
+
+            switch (sourceType)
+            {
+                case BuiltInType.SByte:
+                case BuiltInType.Byte:
+                    return FitsInType(delta, BuiltInType.Int16) ? BuiltInType.Int16 : GetDeltaType(BuiltInType.Int16, delta);
+                case BuiltInType.Int16:
+                case BuiltInType.UInt16:
+                    return FitsInType(delta, BuiltInType.Int32) ? BuiltInType.Int32 : GetDeltaType(BuiltInType.Int32, delta);
+                case BuiltInType.Int32:
+                case BuiltInType.UInt32:
+                    return FitsInType(delta, BuiltInType.Int64) ? BuiltInType.Int64 : BuiltInType.Double;
+                default:
+                    return BuiltInType.Double;
+            }
         }
     }
 }

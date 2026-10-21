@@ -25,6 +25,11 @@
     <PackageReference Include="BenchmarkDotNet" />
   </ItemGroup>
   <ItemGroup>
+    <!-- OPC 10000-13 v1.05.07 Annex A examples (UA-Nodeset Schema/AggregateExamples.csv) -->
+    <None Remove="Part13\AggregateExamples.csv" />
+    <EmbeddedResource Include="Part13\AggregateExamples.csv" LogicalName="Part13.AggregateExamples.csv" />
+  </ItemGroup>
+  <ItemGroup>
     <Compile Include="..\Common\Main.cs" />
   </ItemGroup>
   <ItemGroup>

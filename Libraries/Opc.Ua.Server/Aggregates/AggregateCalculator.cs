@@ -77,7 +77,7 @@ namespace Opc.Ua.Server
             StartTime = startTime;
             EndTime = endTime;
             ProcessingInterval = processingInterval;
-            Stepped = stepped;
+            m_stepped = stepped;
             Configuration = configuration;
             TimeFlowsBackward = endTime < startTime;
 
@@ -102,6 +102,16 @@ namespace Opc.Ua.Server
         public NodeId AggregateId { get; }
 
         /// <summary>
+        /// The interval contains the start of data (3.1.9: the partial interval at the start of historical)
+        /// </summary>
+        protected bool ContainsDataStart(TimeSlice slice)
+        {
+            return EarliestRawTimestamp != DateTime.MaxValue &&
+                   EarliestRawTimestamp > slice.StartTime &&
+                   EarliestRawTimestamp < slice.EndTime;
+        }
+
+        /// <summary>
         /// Queues a raw value for processing.
         /// </summary>
         /// <param name="value">The data value to process.</param>
@@ -114,21 +124,13 @@ namespace Opc.Ua.Server
                 return false;
             }
 
-            // ignore placeholders in the stream.
+            // ignore placeholders in the stream (e.g. the "first archive entry" Bad_NoData value):
+            // they are not raw data, so they neither start the data nor take part in a calculation.
             if (value.StatusCode.CodeBits == StatusCodes.BadNoData ||
                 value.StatusCode.CodeBits == StatusCodes.BadBoundNotFound)
             {
                 return true;
             }
-
-            // check for start of data.
-            if (m_startOfData == DateTime.MinValue)
-            {
-                m_startOfData = value.SourceTimestamp;
-            }
-
-            // update end of data.
-            m_endOfData = value.SourceTimestamp;
 
             // ensure values are being queued in the right order.
             if (TimeFlowsBackward)
@@ -143,6 +145,45 @@ namespace Opc.Ua.Server
                 return false;
             }
 
+            // non-numeric values cannot be interpolated with a sloped line.
+            if (!m_nonNumericData &&
+                value.WrappedValue.Value != null &&
+                value.WrappedValue.TypeInfo != null &&
+                !TypeInfo.IsNumericType(value.WrappedValue.TypeInfo.BuiltInType))
+            {
+                m_nonNumericData = true;
+            }
+
+            // if the variable type is not explicitly set, determine it from the current value
+            if (VariableType == BuiltInType.Null && value.WrappedValue.TypeInfo != null)
+            {
+                var bt = value.WrappedValue.TypeInfo.BuiltInType;
+
+                // allows only valid buil-in types
+                if (bt != BuiltInType.Null)
+                {
+                    VariableType = bt;
+                }
+            }
+
+            // track the chronological start and end of the queued data. Values arrive newest-first
+            // when time flows backward, so the queue order cannot be used for either; rejected
+            // out-of-order values do not move the data edges.
+            if (m_startOfData == DateTime.MinValue || value.SourceTimestamp < m_startOfData)
+            {
+                m_startOfData = value.SourceTimestamp;
+            }
+
+            if (value.SourceTimestamp > m_endOfData)
+            {
+                m_endOfData = value.SourceTimestamp;
+            }
+
+            if (value.SourceTimestamp < EarliestRawTimestamp)
+            {
+                EarliestRawTimestamp = value.SourceTimestamp;
+            }
+
             // ensure value list is always ordered from past to future.
             if (TimeFlowsBackward)
             {
@@ -151,6 +192,12 @@ namespace Opc.Ua.Server
             else
             {
                 m_values.AddLast(value);
+            }
+
+            // skip values that have no source timestamp.
+            if (value.SourceTimestamp != default)
+            {
+                RawPoints.Add((value.SourceTimestamp, StatusCode.IsBad(value.StatusCode)));
             }
 
             return true;
@@ -189,7 +236,8 @@ namespace Opc.Ua.Server
             DateTime earlyTime = CurrentSlice.StartTime;
             DateTime lateTime = CurrentSlice.EndTime;
 
-            if (CompareTimestamps(lateTime, m_values.First) < 0 ||
+            if (m_values.First == null ||
+                CompareTimestamps(lateTime, m_values.First) < 0 ||
                 CompareTimestamps(earlyTime, m_values.Last) > 0)
             {
                 CurrentSlice.OutOfDataRange = true;
@@ -198,28 +246,40 @@ namespace Opc.Ua.Server
             m_logger.LogTrace("Computing Aggregate {StartTime:HH:mm:ss.fff}", CurrentSlice.StartTime);
 
             // compute the value.
-            DataValue value = ComputeValue(CurrentSlice);
+            DataValue value;
 
-            // check if overlapping the start of data.
-            if (SetPartialBit)
+            try
             {
-                if (m_startOfData > earlyTime && m_startOfData < lateTime)
-                {
-                    value.StatusCode = value.StatusCode.SetAggregateBits(
-                        value.StatusCode.AggregateBits | AggregateBits.Partial);
-                }
+                // no raw data at all (only placeholders were queued).
+                value = m_values.First == null
+                    ? GetNoDataValue(CurrentSlice)
+                    : ComputeValue(CurrentSlice);
+            }
+            catch (OverflowException)
+            {
+                value = new DataValue(Variant.Null, StatusCodes.BadTypeMismatch, GetTimestamp(CurrentSlice), GetTimestamp(CurrentSlice));
+            }
+            catch (InvalidCastException)
+            {
+                value = new DataValue(Variant.Null, StatusCodes.BadTypeMismatch, GetTimestamp(CurrentSlice), GetTimestamp(CurrentSlice));
+            }
 
-                if (!UsingExtrapolation &&
-                    !TimeFlowsBackward &&
-                    m_endOfData >= earlyTime &&
-                    m_endOfData < lateTime)
+            // check if overlapping the start or end of data (Part 13 §5.3.3.2): the interval that
+            // contains the start of data, and the interval that contains the end of data unless
+            // the value was extrapolated. Both checks use the chronological interval, so they
+            // apply in either time direction.
+            if (SetPartialBit && m_startOfData != DateTime.MinValue)
+            {
+                bool containsStartOfData = m_startOfData > earlyTime && m_startOfData < lateTime;
+                bool containsEndOfData = !UsingExtrapolation && m_endOfData >= earlyTime && m_endOfData < lateTime;
+
+                if (containsStartOfData || containsEndOfData)
                 {
-                    value.StatusCode = value.StatusCode.SetAggregateBits(
-                        value.StatusCode.AggregateBits | AggregateBits.Partial);
+                    value.StatusCode = value.StatusCode.SetAggregateBits(value.StatusCode.AggregateBits | AggregateBits.Partial);
                 }
             }
 
-            // force value to null if status code is bad.
+            // force value to null if status code is Bad/BadNoData.
             if (StatusCode.IsBad(value.StatusCode))
             {
                 value.WrappedValue = Variant.Null;
@@ -262,20 +322,7 @@ namespace Opc.Ua.Server
                 (!TimeFlowsBackward && CurrentSlice.EndTime >= EndTime) ||
                 (TimeFlowsBackward && CurrentSlice.StartTime <= EndTime);
 
-            if (Complete)
-            {
-                // check if overlapping the end of data.
-                if (SetPartialBit &&
-                    !UsingExtrapolation &&
-                    !TimeFlowsBackward &&
-                    m_endOfData >= earlyTime &&
-                    m_endOfData < lateTime)
-                {
-                    value.StatusCode = value.StatusCode.SetAggregateBits(
-                        value.StatusCode.AggregateBits | AggregateBits.Partial);
-                }
-            }
-            else
+            if (!Complete)
             {
                 CurrentSlice = CreateSlice(CurrentSlice);
             }
@@ -319,9 +366,20 @@ namespace Opc.Ua.Server
         protected double ProcessingInterval { get; }
 
         /// <summary>
-        /// True if the data series requires stepped interpolation.
+        /// True if the data series requires stepped interpolation: the variable is configured as
+        /// Stepped, or its values are not numeric. Only numeric values can be interpolated with a
+        /// sloped line (Part 13 §5.4.2.3, Table 50), so Boolean, String and other non-numeric values
+        /// always use the value of the prior raw value.
         /// </summary>
-        protected bool Stepped { get; }
+        protected bool Stepped => m_stepped || m_nonNumericData;
+
+        /// <summary>
+        /// True if values calculated by sloped interpolation are converted back to the data type of
+        /// the raw values (OPC 10000-4 §7.7.3), as aggregates that return the raw data type need.
+        /// TimeAverage and Total return a Double and use the real-valued bound (Part 13 §3.1.8), so
+        /// their calculator clears it.
+        /// </summary>
+        protected bool CastBoundsToSourceType { get; set; } = true;
 
         /// <summary>
         /// The configuration to use when processing.
@@ -357,6 +415,45 @@ namespace Opc.Ua.Server
         /// True if data is extrapolated after the end of data.
         /// </summary>
         protected bool UsingExtrapolation { get; set; }
+
+
+        /// <summary>
+        /// Original data type of the raw values (e.g. Boolean, String, Double), before any aggregation.
+        /// Determines how regions are treated: types like Boolean/String aren't interpolatable,
+        /// so they follow different Duration rules than numeric types.
+        /// </summary>
+        protected TypeInfo RawDataType
+        {
+            get
+            {
+                for (var i = m_values.First; i != null; i = i.Next)
+                {
+                    var typeInfo = i.Value.WrappedValue.TypeInfo;
+                    if (!i.Value.WrappedValue.IsNull && typeInfo != null && typeInfo.BuiltInType != BuiltInType.Null)
+                    {
+                        return typeInfo;
+                    }
+                }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Variable data type (Boolean, String, Double, etc.), captured once from the first real data point.
+        /// Remains unchanged across all slices, unlike values[0].TypeInfo, which may vary per slice.
+        /// </summary>
+        protected BuiltInType VariableType { get; private set; } = BuiltInType.Null;
+
+        /// <summary>
+        /// Raw point timestamps and real Bad flags, stored in the order they arrive.
+        /// Used to determine the typical sampling interval and find the next point for end-of-data handling.
+        /// </summary>
+        protected List<(DateTime Timestamp, bool IsRealBad)> RawPoints { get; } = new List<(DateTime, bool)>();
+
+        /// <summary>
+        /// Earliest raw point timestamp, excluding BadNoData. Identifies the start of available data.
+        /// </summary>
+        private DateTime EarliestRawTimestamp { get; set; } = DateTime.MaxValue;
 
         /// <summary>
         /// Compares timestamps for two DataValues according to the current UseServerTimestamp setting.
@@ -485,6 +582,18 @@ namespace Opc.Ua.Server
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Checks if a raw value can form a bounding value. Part 13 §3.1.8 and §3.1.9 build
+        /// bounding values from non-Bad raw values; TreatUncertainAsBad does not apply to them
+        /// (Mantis 11462), an Uncertain raw value makes the bound Uncertain_DataSubNormal instead.
+        /// </summary>
+        /// <param name="value">The raw value to test.</param>
+        /// <returns>True if the value is not Bad.</returns>
+        protected static bool IsBoundCandidate(DataValue value)
+        {
+            return value != null && !StatusCode.IsBad(value.StatusCode);
         }
 
         /// <summary>
@@ -649,7 +758,7 @@ namespace Opc.Ua.Server
                             slice.NonBadEarlyBound = ii;
                         }
 
-                        if (IsGood(ii.Value))
+                        if (IsBoundCandidate(ii.Value))
                         {
                             slice.SecondEarlyBound = slice.EarlyBound;
                             slice.EarlyBound = ii;
@@ -661,7 +770,7 @@ namespace Opc.Ua.Server
                     // check if after the end if the slice.
                     if (CompareTimestamps(slice.EndTime, ii) < 0)
                     {
-                        if (IsGood(ii.Value))
+                        if (IsBoundCandidate(ii.Value))
                         {
                             slice.LateBound = ii;
                             break;
@@ -671,7 +780,10 @@ namespace Opc.Ua.Server
                     }
 
                     // save first value in the slice.
-                    slice.End ??= ii;
+                    if (slice.End == null)
+                    {
+                        slice.End = ii;
+                    }
 
                     // save end of slice.
                     if (slice.Begin == null)
@@ -690,7 +802,7 @@ namespace Opc.Ua.Server
                             slice.NonBadEarlyBound = ii;
                         }
 
-                        if (IsGood(ii.Value))
+                        if (IsBoundCandidate(ii.Value))
                         {
                             slice.SecondEarlyBound = slice.EarlyBound;
                             slice.EarlyBound = ii;
@@ -703,7 +815,7 @@ namespace Opc.Ua.Server
                     // check if after the end if the slice.
                     if (CompareTimestamps(slice.EndTime, ii) < 0)
                     {
-                        if (IsGood(ii.Value))
+                        if (IsBoundCandidate(ii.Value))
                         {
                             slice.LateBound = ii;
                             slice.LastProcessedValue = ii;
@@ -714,7 +826,10 @@ namespace Opc.Ua.Server
                     }
 
                     // save first value in the slice.
-                    slice.Begin ??= ii;
+                    if (slice.Begin == null)
+                    {
+                        slice.Begin = ii;
+                    }
 
                     // save end of slice.
                     slice.End = ii;
@@ -821,7 +936,7 @@ namespace Opc.Ua.Server
 
                 if (comparison == 0)
                 {
-                    if (StatusCode.IsNotBad(ii.Value.StatusCode))
+                    if (IsBoundCandidate(ii.Value))
                     {
                         return ii.Value;
                     }
@@ -839,7 +954,7 @@ namespace Opc.Ua.Server
             UpdateSlice(slice);
 
             // check for value at the timestamp.
-            if (slice.Begin != null && IsGood(slice.Begin.Value))
+            if (slice.Begin != null && IsBoundCandidate(slice.Begin.Value))
             {
                 return slice.Begin.Value;
             }
@@ -853,7 +968,7 @@ namespace Opc.Ua.Server
                 // check if sloped interpolation is possible.
                 if (slice.EarlyBound != null && slice.LateBound != null)
                 {
-                    dataValue = SlopedInterpolate(
+                    dataValue = SlopedInterpolateWithIntegerTruncation(
                         timestamp,
                         slice.EarlyBound.Value,
                         slice.LateBound.Value);
@@ -861,7 +976,7 @@ namespace Opc.Ua.Server
                     if (!ReferenceEquals(slice.EarlyBound.Next, slice.LateBound))
                     {
                         dataValue.StatusCode = dataValue.StatusCode
-                            .SetCodeBits(StatusCodes.UncertainDataSubNormal);
+                                                   .SetCodeBits(StatusCodes.UncertainDataSubNormal);
                     }
 
                     return dataValue;
@@ -877,7 +992,8 @@ namespace Opc.Ua.Server
                         dataValue = SlopedInterpolate(
                             timestamp,
                             slice.SecondEarlyBound.Value,
-                            slice.EarlyBound.Value);
+                            slice.EarlyBound.Value,
+                            CastBoundsToSourceType);
                         dataValue.StatusCode = dataValue.StatusCode
                             .SetCodeBits(StatusCodes.UncertainDataSubNormal);
                         return dataValue;
@@ -901,11 +1017,58 @@ namespace Opc.Ua.Server
                         .SetCodeBits(StatusCodes.UncertainDataSubNormal);
                 }
 
+                // Part 13 §3.1.8, SteppedInterpolation: "Uncertain_DataSubNormal if any Bad values
+                // exist between the before value and the timestamp". A Bad raw value exactly on the
+                // timestamp is not between them, so the stepped bound stays Good (CTT 1.05.513
+                // Interpolative 005-05 on the Stepped Historian3 at 12:00:42).
+
                 return dataValue;
             }
 
             // no data found.
             return GetNoDataValue(timestamp);
+        }
+
+        /// <summary>
+        /// Performs sloped interpolation for the Interpolative aggregate.
+        /// Recalculates only the value, keeping the status and timestamps from <see cref="SlopedInterpolate(DateTime, DataValue, DataValue, bool)"/>.
+        /// </summary>
+        private DataValue SlopedInterpolateWithIntegerTruncation(DateTime timestamp, DataValue startBound, DataValue endBound)
+        {
+            DataValue result = SlopedInterpolate(timestamp, startBound, endBound, CastBoundsToSourceType);
+
+            BuiltInType builtInType = result.WrappedValue.TypeInfo?.BuiltInType ?? BuiltInType.Null;
+
+            bool isIntegerType = TypeInfo.IsNumericType(builtInType) &&
+                                 builtInType != BuiltInType.Float &&
+                                 builtInType != BuiltInType.Double;
+
+            if (AggregateId != ObjectIds.AggregateFunction_Interpolative || StatusCode.IsBad(result.StatusCode) || !isIntegerType)
+            {
+                return result;
+            }
+
+            // arrange bounds chronologically so both time directions give the same result.
+            if (startBound.SourceTimestamp > endBound.SourceTimestamp)
+            {
+                (startBound, endBound) = (endBound, startBound);
+            }
+
+            double startValue = CastToDouble(startBound);
+            double endValue = CastToDouble(endBound);
+            double intervalMs = (endBound.SourceTimestamp - startBound.SourceTimestamp).TotalMilliseconds;
+            double offsetMs = (timestamp - startBound.SourceTimestamp).TotalMilliseconds;
+
+            double interpolatedValue = startValue + (endValue - startValue) * offsetMs / intervalMs;
+
+            const double truncationEpsilon = 1e-9; // e.g. epsilon keeps 388.9999999 from dropping to 388
+
+            // truncate integer results with a small adjustment for floating-point errors.
+            double truncatedValue = Math.Truncate(interpolatedValue + Math.Sign(interpolatedValue) * truncationEpsilon);
+
+            result.Value = CastToOriginalType(interpolatedValue, startBound);
+
+            return result;
         }
 
         /// <summary>
@@ -945,13 +1108,39 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Calculate the value at the timestamp using slopped interpolation.
+        /// Calculate the value at the timestamp using sloped interpolation. The interpolated value
+        /// is converted back to the variable's original type.
         /// </summary>
         public static DataValue SlopedInterpolate(
             DateTime timestamp,
             DataValue earlyBound,
             DataValue lateBound)
         {
+            return SlopedInterpolate(timestamp, earlyBound, lateBound, true);
+        }
+
+        /// <summary>
+        /// Calculate the value at the timestamp using slopped interpolation.
+        /// <param name="timestamp"></param>
+        /// <param name="earlyBound"></param>
+        /// <param name="lateBound"></param>
+        /// <param name="useOriginalType">
+        /// If true, the interpolated value is converted back to the variable's original type.
+        /// useOriginalType=true rounds the double result (e.g. Int)
+        /// useOriginalType=false it stays a raw Double
+        /// </param>
+        /// </summary>
+        public static DataValue SlopedInterpolate(
+            DateTime timestamp,
+            DataValue earlyBound,
+            DataValue lateBound,
+            bool useOriginalType)
+        {
+            if (earlyBound is null)
+            {
+                throw new ArgumentNullException(nameof(earlyBound));
+            }
+
             try
             {
                 // can't interpolate if no start bound.
@@ -989,7 +1178,9 @@ namespace Opc.Ua.Server
                 // convert back to original type.
                 var dataValue = new DataValue
                 {
-                    WrappedValue = CastToOriginalType(calculatedValue, earlyBound),
+                    WrappedValue = useOriginalType
+                        ? CastToOriginalType(calculatedValue, earlyBound)
+                        : new Variant(calculatedValue, TypeInfo.Scalars.Double),
                     SourceTimestamp = timestamp,
                     ServerTimestamp = timestamp,
                     StatusCode = StatusCodes.Good
@@ -1034,17 +1225,85 @@ namespace Opc.Ua.Server
         /// </summary>
         protected static Variant CastToOriginalType(double value, DataValue original)
         {
+            BuiltInType targetType = original.WrappedValue.TypeInfo.BuiltInType;
+
+            // For integer types, use half-away-from-zero rounding rather than letting TypeInfo.Cast truncate.
+            if (IsIntegerType(targetType))
+            {
+                value = Math.Round(value, MidpointRounding.AwayFromZero);
+            }
+
             object castValue = TypeInfo.Cast(
                 value,
                 TypeInfo.Scalars.Double,
-                original.WrappedValue.TypeInfo.BuiltInType);
+                targetType);
+
             return new Variant(castValue, original.WrappedValue.TypeInfo);
+        }
+
+        /// <summary>
+        /// True if the value fits into the numeric built-in type without overflow.
+        /// </summary>
+        protected static bool FitsInType(double value, BuiltInType type)
+        {
+            switch (type)
+            {
+                case BuiltInType.SByte: return value >= sbyte.MinValue && value <= sbyte.MaxValue;
+                case BuiltInType.Byte: return value >= byte.MinValue && value <= byte.MaxValue;
+                case BuiltInType.Int16: return value >= short.MinValue && value <= short.MaxValue;
+                case BuiltInType.UInt16: return value >= ushort.MinValue && value <= ushort.MaxValue;
+                case BuiltInType.Int32: return value >= int.MinValue && value <= int.MaxValue;
+                case BuiltInType.UInt32: return value >= uint.MinValue && value <= uint.MaxValue;
+                case BuiltInType.Int64: return value >= long.MinValue && value < long.MaxValue;
+                case BuiltInType.UInt64: return value >= ulong.MinValue && value < ulong.MaxValue;
+                case BuiltInType.Float: return Math.Abs(value) <= float.MaxValue;
+                case BuiltInType.Double: return true;
+                default: return false;
+            }
+        }
+
+        /// <summary>
+        /// Rounds a real value for an integer data type as OPC 10000-4 §7.7.3 says: "adding 0.5
+        /// and truncating" (2.5 becomes 3).
+        /// </summary>
+        protected static double RoundHalfUp(double value)
+        {
+            return Math.Floor(value + 0.5);
+        }
+
+        /// <summary>
+        /// Checks whether the built-in type is an integer type.
+        /// </summary>
+        protected static bool IsIntegerType(BuiltInType t)
+        {
+            switch (t)
+            {
+                case BuiltInType.Int16:
+                case BuiltInType.UInt16:
+                case BuiltInType.Int32:
+                case BuiltInType.UInt32:
+                case BuiltInType.Int64:
+                case BuiltInType.UInt64:
+                case BuiltInType.SByte:
+                case BuiltInType.Byte:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// <summary>
+        /// Returns the simple bound for the timestamp, converted to the variable's original type.
+        /// </summary>
+        protected DataValue GetSimpleBound(DateTime timestamp, TimeSlice slice)
+        {
+            return GetSimpleBound(timestamp, slice, true);
         }
 
         /// <summary>
         /// Returns the simple bound for the timestamp.
         /// </summary>
-        protected DataValue GetSimpleBound(DateTime timestamp, TimeSlice slice)
+        protected DataValue GetSimpleBound(DateTime timestamp, TimeSlice slice, bool useOriginalType)
         {
             // choose the start point
             LinkedListNode<DataValue> start = slice.EarlyBound ?? m_values.First;
@@ -1077,8 +1336,10 @@ namespace Opc.Ua.Server
                 startBound = ii;
             }
 
-            // check if no data found or if start bound is bad..
-            if (startBound == null || !IsGood(startBound.Value))
+            // check if no data found or if start bound is bad. Part 13 §3.1.9: only a Bad raw
+            // value before the timestamp gives Bad_NoData, an Uncertain one gives an Uncertain
+            // bound; TreatUncertainAsBad does not apply to bounds (Mantis 11462).
+            if (startBound == null || !IsBoundCandidate(startBound.Value))
             {
                 return GetNoDataValue(timestamp);
             }
@@ -1089,12 +1350,14 @@ namespace Opc.Ua.Server
 
             if (!Stepped)
             {
+                LinkedListNode<DataValue> endBound2 = startBound.Next;
                 if (endBound != null)
                 {
-                    // do sloped interpolation if two good bounds exist.
-                    if (IsGood(endBound.Value))
+                    // do sloped interpolation unless the raw value after the timestamp is Bad
+                    // (Part 13 §3.1.9); an Uncertain one makes the bound Uncertain_DataSubNormal.
+                    if (IsBoundCandidate(endBound.Value))
                     {
-                        return SlopedInterpolate(timestamp, startBound.Value, endBound.Value);
+                        return SlopedInterpolate(timestamp, startBound.Value, endBound.Value, useOriginalType);
                     }
                 }
 
@@ -1122,6 +1385,29 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
+        /// Finds the raw value at or immediately before the timestamp.
+        /// </summary>
+        /// <param name="timestamp">The timestamp.</param>
+        /// <param name="value">The raw value, null if none was found.</param>
+        /// <returns>True if a raw value at or before the timestamp exists.</returns>
+        protected bool TryGetRawValueAtOrBefore(DateTime timestamp, out DataValue value)
+        {
+            value = null;
+
+            for (LinkedListNode<DataValue> ii = m_values.First; ii != null; ii = ii.Next)
+            {
+                if (CompareTimestamps(timestamp, ii) < 0)
+                {
+                    break;
+                }
+
+                value = ii.Value;
+            }
+
+            return value != null;
+        }
+
+        /// <summary>
         /// Returns the values in the list with simple bounds.
         /// </summary>
         protected List<DataValue> GetValuesWithSimpleBounds(TimeSlice slice)
@@ -1136,7 +1422,7 @@ namespace Opc.Ua.Server
             var values = new List<DataValue>();
 
             // add the start point.
-            DataValue startBound = GetSimpleBound(slice.StartTime, slice);
+            DataValue startBound = GetSimpleBound(slice.StartTime, slice, useOriginalType: false);
 
             if (startBound != null)
             {
@@ -1158,7 +1444,7 @@ namespace Opc.Ua.Server
             }
 
             // add the end point.
-            DataValue endBound = GetSimpleBound(slice.EndTime, slice);
+            DataValue endBound = GetSimpleBound(slice.EndTime, slice, useOriginalType: false);
 
             if (endBound != null)
             {
@@ -1328,7 +1614,8 @@ namespace Opc.Ua.Server
                     }
                     catch (Exception)
                     {
-                        currentStatus = StatusCodes.BadTypeMismatch;
+                        // do not set BadTypeMismatch. For non-numeric types, a Good value remains Good.
+                        currentValue = 0;
                     }
                 }
                 else
@@ -1363,7 +1650,15 @@ namespace Opc.Ua.Server
                         else if (!useSteppedCalculations &&
                             StatusCode.IsNotGood(values[ii].StatusCode))
                         {
-                            currentRegion.StatusCode = StatusCodes.UncertainDataSubNormal;
+                            // do not automatically mark non-Good values as UncertainDataSubNormal. Keep their numeric value instead.
+                            try
+                            {
+                                currentValue = CastToDouble(values[ii]);
+                            }
+                            catch (Exception)
+                            {
+                                currentValue = 0;
+                            }
                         }
                     }
                 }
@@ -1404,7 +1699,7 @@ namespace Opc.Ua.Server
                     // must be end of data if start of region is good yet end bound is bad.
                     if (!ignoreBadData &&
                         IsGood(currentRegion.DataPoint) &&
-                        currentStatus == StatusCodes.BadNoData &&
+                        currentStatus.CodeBits == StatusCodes.BadNoData &&   // the end of data, not a Bad raw value
                         ii == values.Count - 1)
                     {
                         currentRegion.Duration = 1;
@@ -1412,17 +1707,24 @@ namespace Opc.Ua.Server
                     // calculate region span.
                     else
                     {
-                        // set uncertain status to bad if treat uncertain as bad is true.
-                        if (StatusCode.IsUncertain(currentStatus) && !IsGood(values[ii]))
-                        {
-                            currentStatus = StatusCodes.BadNoData;
-                        }
-
                         currentRegion.Duration = (currentTime - currentRegion.StartTime)
                             .TotalMilliseconds;
                     }
 
                     regions.Add(currentRegion);
+                }
+
+                // set uncertain status to bad if treat uncertain as bad is true (Part 13 §5.4.3.2.1:
+                // Uncertain regions are included as Bad regions). Without ignoreBadData (Simple
+                // Bounding Values) this applies to the first region too: an Uncertain start bound is
+                // treated as any other Uncertain value in the interval (Mantis 11462). With
+                // Interpolated Bounding Values an Uncertain start bound is used and makes the result
+                // Uncertain.
+                if (StatusCode.IsUncertain(currentStatus) &&
+                    !IsGood(values[ii]) &&
+                    (currentRegion != null || !ignoreBadData))
+                {
+                    currentStatus = StatusCodes.BadNoData;
                 }
 
                 // start a new region.
@@ -1440,14 +1742,38 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Calculates the value based status code for the slice
+        /// Calculates the value based status code for the slice; with TreatUncertainAsBad = false
+        /// an Uncertain value counts as Good (Part 13 §4.2.1.2).
         /// </summary>
+        /// <param name="slice">The time slice.</param>
+        /// <param name="values">The values in the slice.</param>
+        /// <param name="statusCode">The status code to update.</param>
         protected StatusCode GetValueBasedStatusCode(
             TimeSlice slice,
             List<DataValue> values,
             StatusCode statusCode)
         {
-            // compute the total good/bad/uncertain.
+            return GetValueBasedStatusCode(slice, values, statusCode, true);
+        }
+
+        /// <summary>
+        /// Calculates the value based status code for the slice
+        /// </summary>
+        /// <param name="slice">The time slice.</param>
+        /// <param name="values">The values in the slice.</param>
+        /// <param name="statusCode">The status code to update.</param>
+        /// <param name="uncertainIsGood">
+        /// True (default): with TreatUncertainAsBad = false an Uncertain value counts as Good
+        /// (Part 13 §4.2.1.2). False: an Uncertain value is never Good; it counts as Bad with
+        /// TreatUncertainAsBad = true and as neither Good nor Bad otherwise (Count, Mantis 11495).
+        /// </param>
+        protected StatusCode GetValueBasedStatusCode(
+            TimeSlice slice,
+            List<DataValue> values,
+            StatusCode statusCode,
+            bool uncertainIsGood)
+        {
+            // compute the total good/bad.
             double badCount = 0;
             double goodCount = 0;
             double totalCount = 0;
@@ -1456,31 +1782,63 @@ namespace Opc.Ua.Server
             {
                 totalCount++;
 
-                if (StatusCode.IsBad(values[ii].StatusCode))
-                {
-                    badCount++;
-                    continue;
-                }
+                // Part 13 §4.2.1.2 and §5.4.3.2.1:
+                // - Good => goodCount++
+                // - Bad => badCount++
+                // - Uncertain + TreatUncertainAsBad=True  => Uncertain is considered Bad (badCount++)
+                // - Uncertain + TreatUncertainAsBad=False => Uncertain is equivalent to Good (goodCount++)
+                // - uncertainIsGood = false: Uncertain + TreatUncertainAsBad=False is neither Good nor Bad
+                bool isUncertain = StatusCode.IsUncertain(values[ii].StatusCode);
 
-                if (StatusCode.IsGood(values[ii].StatusCode))
+                if (StatusCode.IsGood(values[ii].StatusCode) ||
+                    (uncertainIsGood && !Configuration.TreatUncertainAsBad && isUncertain))
                 {
                     goodCount++;
                 }
+                else if (!isUncertain || Configuration.TreatUncertainAsBad)
+                {
+                    badCount++;
+                }
             }
 
-            if (totalCount == 0 || goodCount / totalCount * 100 >= Configuration.PercentDataGood)
+            // adjust PercentDataGood for cases where the beginning of the slice is not covered by actual data
+            double sliceDurationMs = Math.Abs((slice.EndTime - slice.StartTime).TotalMilliseconds);
+            double requestDurationMs = Math.Abs((EndTime - StartTime).TotalMilliseconds);
+
+            // the entire request it is not split into multiple slices
+            bool isSingleInterval = ProcessingInterval <= 0 || ProcessingInterval >= requestDurationMs;
+
+            double startGapMs = 0;
+
+            // how much of the beginning of the slice has no data at all
+            if (!TimeFlowsBackward
+                && isSingleInterval
+                && sliceDurationMs > 0
+                && slice.StartTime < m_startOfData
+                && slice.EndTime > m_startOfData)
             {
-                // good if the good count is greater than or equal to the configured threshold.
+                startGapMs = (m_startOfData - slice.StartTime).TotalMilliseconds;
+            }
+
+            double dataCoverageRatio = sliceDurationMs > 0 ? (sliceDurationMs - startGapMs) / sliceDurationMs : 1.0;
+
+            // reduce PercentGood when part of the interval has no data (dataCoverageRatio)
+            double percentGood = (totalCount > 0 ? (goodCount / totalCount * 100.0) : 100.0) * dataCoverageRatio;
+            double percentBad = totalCount > 0 ? (badCount / totalCount * 100.0) : 0.0;
+
+            // indicates whether the quality decision is based only on the PercentDataGood
+            bool useGoodOnly = Configuration.PercentDataGood + Configuration.PercentDataBad == 100;
+
+            if (percentGood >= Configuration.PercentDataGood)
+            {
                 statusCode = statusCode.SetCodeBits(StatusCodes.Good);
             }
-            else if (badCount / totalCount * 100 >= Configuration.PercentDataBad)
+            else if (!useGoodOnly && percentBad >= Configuration.PercentDataBad)
             {
-                // bad if the bad count is greater than or equal to the configured threshold.
-                statusCode = StatusCodes.Bad;
+                statusCode = statusCode.SetCodeBits(StatusCodes.Bad);
             }
             else
             {
-                // uncertain if did not meet the Good or Bad requirements
                 statusCode = statusCode.SetCodeBits(StatusCodes.UncertainDataSubNormal);
             }
 
@@ -1526,16 +1884,15 @@ namespace Opc.Ua.Server
             {
                 totalDuration += region.Duration;
 
-                if (StatusCode.IsBad(region.StatusCode))
+                // Part 13 §5.4.3.2.1: Uncertain regions count as Bad when TreatUncertainAsBad
+                // is true and as Good otherwise.
+                if (StatusCode.IsBad(region.StatusCode) ||
+                    (Configuration.TreatUncertainAsBad &&
+                        StatusCode.IsUncertain(region.StatusCode)))
                 {
                     badDuration += region.Duration;
-                    continue;
                 }
-
-                // Take into account the Uncertain status code
-                if (StatusCode.IsGood(region.StatusCode) ||
-                    (!Configuration.TreatUncertainAsBad &&
-                        StatusCode.IsUncertain(region.StatusCode)))
+                else
                 {
                     goodDuration += region.Duration;
                 }
@@ -1547,10 +1904,16 @@ namespace Opc.Ua.Server
                 // good if the good duration is greater than or equal to the configured threshold.
                 statusCode = statusCode.SetCodeBits(StatusCodes.Good);
             }
-            else if (badDuration / totalDuration * 100 >= Configuration.PercentDataBad)
+            else if (Configuration.PercentDataGood + Configuration.PercentDataBad != 100 &&
+                badDuration / totalDuration * 100 >= Configuration.PercentDataBad)
             {
                 // bad if the bad duration is greater than or equal to the configured threshold.
-                statusCode = StatusCodes.Bad;
+                // Part 13 §4.2.1.2: "PercentDataGood ≥ (100 – PercentDataBad). If they are equal the
+                // result of the PercentDataGood calculation is used", so with PercentDataGood =
+                // 100 - PercentDataBad an interval below PercentDataGood is Uncertain, not Bad (as
+                // Annex A Historian3 and the CTT 1.05.513 Aggregate tests expect).
+                // Keep the aggregate bits like the Good and Uncertain results.
+                statusCode = statusCode.SetCodeBits(StatusCodes.Bad);
             }
             else
             {
@@ -1566,5 +1929,7 @@ namespace Opc.Ua.Server
         private readonly LinkedList<DataValue> m_values;
         private DateTime m_startOfData;
         private DateTime m_endOfData;
+        private readonly bool m_stepped;
+        private bool m_nonNumericData;
     }
 }

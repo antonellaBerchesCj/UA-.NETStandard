@@ -46,13 +46,12 @@ namespace Opc.Ua.Server.Tests
     [Parallelizable]
     public class StatusAggregateCalculatorTests
     {
-        private ITelemetryContext m_telemetry;
         private AggregateConfiguration m_configuration;
+        private ITelemetryContext m_telemetry;
 
         [SetUp]
         public void SetUp()
         {
-            m_telemetry = NUnitTelemetryContext.Create();
             m_configuration = new AggregateConfiguration
             {
                 TreatUncertainAsBad = false,
@@ -60,10 +59,37 @@ namespace Opc.Ua.Server.Tests
                 PercentDataGood = 100,
                 UseSlopedExtrapolation = false
             };
+
+            m_telemetry = NUnitTelemetryContext.Create();
+        }
+
+        /// <summary>
+        /// A raw value and its status.
+        /// </summary>
+        /// <remarks>
+        /// 1.4.371: replaces the (double Value, StatusCode Status) tuple, ValueTuple is not
+        /// available for every target framework.
+        /// </remarks>
+        private struct RawSample
+        {
+            public RawSample(double value, StatusCode status)
+            {
+                Value = value;
+                Status = status;
+            }
+
+            public double Value { get; }
+
+            public StatusCode Status { get; }
+        }
+
+        private static RawSample Sample(double value, StatusCode status)
+        {
+            return new RawSample(value, status);
         }
 
         private static List<DataValue> CreateDataValues(
-            DateTime startTime, (double Value, StatusCode Status)[] items, double intervalMs = 1000)
+            DateTime startTime, RawSample[] items, double intervalMs = 1000)
         {
             var dataValues = new List<DataValue>();
             for (int i = 0; i < items.Length; i++)
@@ -115,13 +141,14 @@ namespace Opc.Ua.Server.Tests
             DateTime endTime = startTime.AddMilliseconds(10000);
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.Good),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.Good),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 2000);
 
             DataValue result = ComputeAggregate(
@@ -144,13 +171,14 @@ namespace Opc.Ua.Server.Tests
             // values are handled.
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Bad),
-                    (3, StatusCodes.Bad),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Bad),
+                    Sample(3, StatusCodes.Bad),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 1000);
 
             DataValue result = ComputeAggregate(
@@ -170,13 +198,14 @@ namespace Opc.Ua.Server.Tests
 
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Uncertain),
-                    (3, StatusCodes.Uncertain),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Uncertain),
+                    Sample(3, StatusCodes.Uncertain),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 1000);
 
             DataValue result = ComputeAggregate(
@@ -193,17 +222,19 @@ namespace Opc.Ua.Server.Tests
             DateTime endTime = startTime.AddMilliseconds(2000);
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.GoodClamped),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.Good)
-                ]);
+                new[]
+                {
+                    Sample(1, StatusCodes.GoodClamped),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.Good)
+                });
 
             DataValue result = ComputeAggregate(
                 ObjectIds.AggregateFunction_WorstQuality, values, startTime, endTime, 2000);
 
             Assert.That(result.WrappedValue.TryGetValue(out StatusCode worst), Is.True);
-            Assert.That(worst, Is.EqualTo(StatusCodes.GoodClamped));
+            // 1.4.371: StatusCode does not implement IEquatable<uint>, compare the 32-bit code.
+            Assert.That(worst.Code, Is.EqualTo(StatusCodes.GoodClamped));
             Assert.That(
                 result.StatusCode.AggregateBits,
                 Is.EqualTo(AggregateBits.Calculated | AggregateBits.MultipleValues));
@@ -216,19 +247,21 @@ namespace Opc.Ua.Server.Tests
             DateTime endTime = startTime.AddMilliseconds(4000);
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.GoodClamped),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.UncertainLastUsableValue),
-                    (4, StatusCodes.UncertainDataSubNormal),
-                    (5, StatusCodes.Good)
-                ]);
+                new[]
+                {
+                    Sample(1, StatusCodes.GoodClamped),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.UncertainLastUsableValue),
+                    Sample(4, StatusCodes.UncertainDataSubNormal),
+                    Sample(5, StatusCodes.Good)
+                });
 
             DataValue result = ComputeAggregate(
                 ObjectIds.AggregateFunction_WorstQuality, values, startTime, endTime, 4000);
 
             Assert.That(result.WrappedValue.TryGetValue(out StatusCode worst), Is.True);
-            Assert.That(worst, Is.EqualTo(StatusCodes.UncertainLastUsableValue));
+            // 1.4.371: StatusCode does not implement IEquatable<uint>, compare the 32-bit code.
+            Assert.That(worst.Code, Is.EqualTo(StatusCodes.UncertainLastUsableValue));
             Assert.That(
                 result.StatusCode.AggregateBits,
                 Is.EqualTo(AggregateBits.Calculated | AggregateBits.MultipleValues));
@@ -241,51 +274,65 @@ namespace Opc.Ua.Server.Tests
             DateTime endTime = startTime.AddMilliseconds(6000);
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.GoodClamped),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.UncertainLastUsableValue),
-                    (4, StatusCodes.UncertainDataSubNormal),
-                    (5, StatusCodes.BadOutOfRange),
-                    (6, StatusCodes.BadSensorFailure),
-                    (7, StatusCodes.Good)
-                ]);
+                new[]
+                {
+                    Sample(1, StatusCodes.GoodClamped),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.UncertainLastUsableValue),
+                    Sample(4, StatusCodes.UncertainDataSubNormal),
+                    Sample(5, StatusCodes.BadOutOfRange),
+                    Sample(6, StatusCodes.BadSensorFailure),
+                    Sample(7, StatusCodes.Good)
+                });
 
             DataValue result = ComputeAggregate(
                 ObjectIds.AggregateFunction_WorstQuality, values, startTime, endTime, 6000);
 
             Assert.That(result.WrappedValue.TryGetValue(out StatusCode worst), Is.True);
-            Assert.That(worst, Is.EqualTo(StatusCodes.BadOutOfRange));
+            // 1.4.371: StatusCode does not implement IEquatable<uint>, compare the 32-bit code.
+            Assert.That(worst.Code, Is.EqualTo(StatusCodes.BadOutOfRange));
             Assert.That(
                 result.StatusCode.AggregateBits,
                 Is.EqualTo(AggregateBits.Calculated | AggregateBits.MultipleValues));
         }
 
+        /// <summary>
+        /// Part 13 §5.4.3.36 and §5.4.2.2: the start bound is taken at the early time of the
+        /// interval in both directions. A forward interval [2 s, 8 s) excludes the raw value at
+        /// 8 s; a backward interval (2 s, 8 s] includes the raw value at 8 s and excludes the
+        /// value after it.
+        /// </summary>
         [TestCase(false)]
         [TestCase(true)]
-        public void WorstQuality2IncludesRequestStartAndExcludesRequestEnd(bool reverse)
+        public void WorstQuality2IncludesEarlyStartBoundAndExcludesOpenIntervalEdge(bool reverse)
         {
             var baseTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime startTime = baseTime.AddMilliseconds(reverse ? 8000 : 2000);
             DateTime endTime = baseTime.AddMilliseconds(reverse ? 2000 : 8000);
             List<DataValue> values = reverse
                 ?
-                [
+                new List<DataValue>
+                {
                     new DataValue(
                         new Variant(1),
-                        StatusCodes.BadOutOfRange,
-                        baseTime.AddMilliseconds(2000)),
+                        StatusCodes.UncertainLastUsableValue,
+                        baseTime),
                     new DataValue(
                         new Variant(2),
                         StatusCodes.Good,
                         baseTime.AddMilliseconds(4000)),
                     new DataValue(
                         new Variant(3),
-                        StatusCodes.UncertainLastUsableValue,
+                        StatusCodes.Good,
+                        baseTime.AddMilliseconds(8000)),
+                    new DataValue(
+                        new Variant(4),
+                        StatusCodes.BadSensorFailure,
                         baseTime.AddMilliseconds(10000))
-                ]
+                }
                 :
-                [
+                new List<DataValue>
+                {
                     new DataValue(
                         new Variant(1),
                         StatusCodes.UncertainLastUsableValue,
@@ -298,13 +345,14 @@ namespace Opc.Ua.Server.Tests
                         new Variant(3),
                         StatusCodes.BadSensorFailure,
                         baseTime.AddMilliseconds(8000))
-                ];
+                };
 
             DataValue result = ComputeAggregate(
                 ObjectIds.AggregateFunction_WorstQuality2, values, startTime, endTime, 6000);
 
             Assert.That(result.WrappedValue.TryGetValue(out StatusCode worst), Is.True);
-            Assert.That(worst, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
+            // 1.4.371: StatusCode does not implement IEquatable<uint>, compare the 32-bit code.
+            Assert.That(worst.Code, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
             Assert.That(result.SourceTimestamp, Is.EqualTo(startTime));
             Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.Good));
             Assert.That(result.StatusCode.AggregateBits, Is.EqualTo(AggregateBits.Calculated));
@@ -320,15 +368,20 @@ namespace Opc.Ua.Server.Tests
             StatusCode lateStatus = reverse ? StatusCodes.BadSensorFailure : StatusCodes.Good;
             List<DataValue> values = CreateDataValues(
                 earlyTime,
-                [
-                    (1, earlyStatus),
-                    (2, StatusCodes.BadOutOfRange),
-                    (3, lateStatus)
-                ],
+                new[]
+                {
+                    Sample(1, earlyStatus),
+                    Sample(2, StatusCodes.BadOutOfRange),
+                    Sample(3, lateStatus)
+                },
                 5000);
             DateTime startTime = reverse ? lateTime : earlyTime;
             DateTime endTime = reverse ? earlyTime : lateTime;
-            StatusCode expected = reverse ? StatusCodes.BadSensorFailure : StatusCodes.BadOutOfRange;
+
+            // Part 13 §5.4.2.2: a backward interval is evaluated like the forward one, so the
+            // chronologically first worst value (the interior BadOutOfRange) is reported in
+            // both directions. Backward includes the late BadSensorFailure as a second Bad value.
+            StatusCode expected = StatusCodes.BadOutOfRange;
 
             DataValue result = ComputeAggregate(
                 ObjectIds.AggregateFunction_WorstQuality2, values, startTime, endTime, 10000);
@@ -349,13 +402,14 @@ namespace Opc.Ua.Server.Tests
             // First value at the interval start so the start bound is a Good raw value.
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.Good),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.Good),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 2000);
 
             DataValue result = ComputeAggregate(
@@ -373,13 +427,14 @@ namespace Opc.Ua.Server.Tests
 
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.Good),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.Good),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 2000);
 
             DataValue result = ComputeAggregate(
@@ -397,13 +452,14 @@ namespace Opc.Ua.Server.Tests
 
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.Good),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.Good),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 2000);
 
             DataValue result = ComputeAggregate(
@@ -425,13 +481,14 @@ namespace Opc.Ua.Server.Tests
 
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Bad),
-                    (3, StatusCodes.Bad),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Bad),
+                    Sample(3, StatusCodes.Bad),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 1000);
 
             DataValue result = ComputeAggregate(
@@ -450,13 +507,14 @@ namespace Opc.Ua.Server.Tests
 
             List<DataValue> values = CreateDataValues(
                 startTime,
-                [
-                    (1, StatusCodes.Good),
-                    (2, StatusCodes.Good),
-                    (3, StatusCodes.Good),
-                    (4, StatusCodes.Good),
-                    (5, StatusCodes.Good)
-                ],
+                new[]
+                {
+                    Sample(1, StatusCodes.Good),
+                    Sample(2, StatusCodes.Good),
+                    Sample(3, StatusCodes.Good),
+                    Sample(4, StatusCodes.Good),
+                    Sample(5, StatusCodes.Good)
+                },
                 2000);
 
             DataValue result = ComputeAggregate(

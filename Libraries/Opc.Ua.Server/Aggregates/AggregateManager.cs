@@ -43,7 +43,7 @@ namespace Opc.Ua.Server
         public AggregateManager(IServerInternal server)
         {
             m_server = server;
-            m_factories = [];
+            m_factories = new NodeIdDictionary<AggregatorFactory>();
             m_minimumProcessingInterval = 1000;
         }
 
@@ -115,15 +115,18 @@ namespace Opc.Ua.Server
         {
             lock (m_lock)
             {
-                m_defaultConfiguration ??= new AggregateConfiguration
+                if (m_defaultConfiguration == null)
                 {
-                    PercentDataBad = 100,
-                    PercentDataGood = 100,
-                    // OPC UA Part 13 specifies that uncertain values are treated as bad by default.
-                    TreatUncertainAsBad = true,
-                    UseSlopedExtrapolation = false,
-                    UseServerCapabilitiesDefaults = false
-                };
+                    m_defaultConfiguration = new AggregateConfiguration
+                    {
+                        PercentDataBad = 100,
+                        PercentDataGood = 100,
+                        // OPC UA Part 13 specifies that uncertain values are treated as bad by default.
+                        TreatUncertainAsBad = true,
+                        UseSlopedExtrapolation = false,
+                        UseServerCapabilitiesDefaults = false
+                    };
+                }
 
                 return m_defaultConfiguration;
             }
@@ -139,6 +142,82 @@ namespace Opc.Ua.Server
             {
                 m_defaultConfiguration = configuration;
             }
+        }
+
+        /// <summary>
+        /// Returns the configuration to use for a request (OPC 10000-4 §7.22.4 Table 146).
+        /// With UseServerCapabilitiesDefaults = True (or no request configuration) the values of the
+        /// variable's AggregateConfiguration object are used and the other request fields are
+        /// ignored; without an HA Configuration the server defaults apply. Otherwise the request
+        /// configuration applies unchanged.
+        /// </summary>
+        /// <param name="haConfiguration">The HA Configuration of the variable, if any.</param>
+        /// <param name="requested">The configuration of the request, if any.</param>
+        /// <returns>The configuration to use.</returns>
+        public AggregateConfiguration GetConfiguration(
+            HistoricalDataConfigurationState haConfiguration,
+            AggregateConfiguration requested)
+        {
+            if (requested != null && !requested.UseServerCapabilitiesDefaults)
+            {
+                return requested;
+            }
+
+            AggregateConfiguration defaults = GetDefaultConfiguration(null);
+            AggregateConfigurationState exposed = haConfiguration?.AggregateConfiguration;
+
+            if (exposed == null)
+            {
+                return defaults;
+            }
+
+            return new AggregateConfiguration
+            {
+                UseServerCapabilitiesDefaults = false,
+                TreatUncertainAsBad = exposed.TreatUncertainAsBad != null
+                    ? exposed.TreatUncertainAsBad.Value
+                    : defaults.TreatUncertainAsBad,
+                PercentDataBad = exposed.PercentDataBad != null
+                    ? exposed.PercentDataBad.Value
+                    : defaults.PercentDataBad,
+                PercentDataGood = exposed.PercentDataGood != null
+                    ? exposed.PercentDataGood.Value
+                    : defaults.PercentDataGood,
+                UseSlopedExtrapolation = exposed.UseSlopedExtrapolation != null
+                    ? exposed.UseSlopedExtrapolation.Value
+                    : defaults.UseSlopedExtrapolation
+            };
+        }
+
+        /// <summary>
+        /// Returns the HA Configuration of a historizing variable (its child "HA Configuration",
+        /// OPC 10000-11 §5.2.2), or null if it has none.
+        /// </summary>
+        /// <param name="context">The system context.</param>
+        /// <param name="variable">The historizing variable.</param>
+        /// <returns>The HA Configuration, or null.</returns>
+        public static HistoricalDataConfigurationState FindHistoricalConfiguration(
+            ISystemContext context,
+            NodeState variable)
+        {
+            if (variable == null)
+            {
+                return null;
+            }
+
+            return variable.FindChild(context, new QualifiedName(BrowseNames.HAConfiguration))
+                as HistoricalDataConfigurationState;
+        }
+
+        /// <summary>
+        /// True if the HA Configuration says Stepped = True; a missing configuration or Stepped
+        /// Property means Stepped = False (OPC 10000-11 §5.2.2 default).
+        /// </summary>
+        /// <param name="haConfiguration">The HA Configuration, if any.</param>
+        /// <returns>The Stepped value.</returns>
+        public static bool IsStepped(HistoricalDataConfigurationState haConfiguration)
+        {
+            return haConfiguration?.Stepped != null && haConfiguration.Stepped.Value;
         }
 
         /// <summary>
@@ -186,7 +265,7 @@ namespace Opc.Ua.Server
                 processingInterval,
                 stepped,
                 configuration,
-                m_server.Telemetry);
+                m_server?.Telemetry);
         }
 
         /// <summary>
@@ -223,7 +302,7 @@ namespace Opc.Ua.Server
             }
         }
 
-        private readonly Lock m_lock = new();
+        private readonly object m_lock = new object();
         private readonly IServerInternal m_server;
         private AggregateConfiguration m_defaultConfiguration;
         private readonly NodeIdDictionary<AggregatorFactory> m_factories;

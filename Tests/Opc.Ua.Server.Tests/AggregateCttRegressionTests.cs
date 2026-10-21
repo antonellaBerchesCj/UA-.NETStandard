@@ -167,10 +167,12 @@ namespace Opc.Ua.Server.Tests
             AssertSingleNumericResult(live, expected, expectedTimestamp, expectedBits);
         }
 
-        [TestCase("PercentGood", false, 50.0)]
+        // Mantis 11425/11495 answer: PercentGood counts only Good regions and PercentBad only Bad
+        // regions; the Uncertain region (5-10 s) is neither, whatever TreatUncertainAsBad is.
+        [TestCase("PercentGood", false, 25.0)]
         [TestCase("PercentBad", false, 50.0)]
         [TestCase("PercentGood", true, 25.0)]
-        [TestCase("PercentBad", true, 75.0)]
+        [TestCase("PercentBad", true, 50.0)]
         public async Task DirectAndLivePercentAggregatesHonorExplicitUncertainConfigurationAsync(
             string aggregateName,
             bool treatUncertainAsBad,

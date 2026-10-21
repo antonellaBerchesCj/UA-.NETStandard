@@ -63,8 +63,8 @@ namespace Opc.Ua.Server
         /// <summary>
         /// Mapping for all of the standard aggregates.
         /// </summary>
-        private static readonly FactoryMapping[] s_mappings =
-        [
+        private static readonly FactoryMapping[] s_mappings = new FactoryMapping[]
+        {
             new FactoryMapping
             {
                 AggregateId = ObjectIds.AggregateFunction_Interpolative,
@@ -287,7 +287,7 @@ namespace Opc.Ua.Server
                 AggregateName = BrowseNames.AggregateFunction_VarianceSample,
                 Calculator = typeof(StdDevAggregateCalculator)
             }
-        ];
+        };
 
         /// <summary>
         /// Returns the name for a standard aggregates.
