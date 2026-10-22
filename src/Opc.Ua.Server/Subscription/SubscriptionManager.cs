@@ -711,6 +711,7 @@ namespace Opc.Ua.Server
                         for (int ii = 0; ii < sessionSubscriptions.Count; ii++)
                         {
                             m_subscriptions.TryRemove(sessionSubscriptions[ii].Id, out _);
+                            m_abandonedSubscriptions.TryRemove(sessionSubscriptions[ii].Id, out _);
                         }
                     }
                     else

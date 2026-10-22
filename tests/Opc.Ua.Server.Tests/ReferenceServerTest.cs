@@ -1728,6 +1728,78 @@ namespace Opc.Ua.Server.Tests
         }
 
         /// <summary>
+        /// Create a secondary Session with a subscription.
+        /// Close session, but do not delete subscriptions, so the subscription is abandoned.
+        /// Transfer the abandoned subscription to another session and close that session
+        /// with DeleteSubscriptions = true.
+        /// The subscription must be gone completely: it must not stay in the list of
+        /// abandoned subscriptions until its lifetime expires.
+        /// </summary>
+        [Test]
+        [DependsOnTest(nameof(TranslateBrowsePathAsync), AllowFailure = true)]
+        public async Task CloseSessionDeletesTransferredAbandonedSubscriptionAsync()
+        {
+            var subscriptionManager = (SubscriptionManager)m_server.CurrentInstance.SubscriptionManager;
+            NamespaceTable namespaceUris = m_server.CurrentInstance.NamespaceUris;
+            NodeId[] testSet =
+            [
+                .. CommonTestWorkers.NodeIdTestSetStatic
+                        .Select(n => ExpandedNodeId.ToNodeId(n, namespaceUris))
+            ];
+
+            // create the subscription and abandon it
+            (RequestHeader ownerRequestHeader, SecureChannelContext ownerContext) = await m_server.CreateAndActivateSessionAsync(
+                "AbandonedOwnerSession",
+                true,
+                clientApplicationUri: kClientApplicationUri).ConfigureAwait(false);
+            var serverTestServices = new ServerTestServices(m_server, ownerContext);
+            ownerRequestHeader.Timestamp = DateTimeUtc.Now;
+            ArrayOf<uint> subscriptionIds = await CommonTestWorkers.CreateSubscriptionForTransferAsync(
+                serverTestServices,
+                ownerRequestHeader,
+                testSet,
+                kQueueSize,
+                -1).ConfigureAwait(false);
+            List<uint> ids = subscriptionIds.ToList();
+
+            ownerRequestHeader.Timestamp = DateTimeUtc.Now;
+            await m_server.CloseSessionAsync(ownerContext, ownerRequestHeader, false, RequestLifetime.None).ConfigureAwait(false);
+            Assert.That(subscriptionManager.CaptureAbandonedPublishTimerSnapshot()
+                .Select(subscription => subscription.Id), Is.SupersetOf(ids));
+
+            // transfer the abandoned subscription to a new session
+            (RequestHeader targetRequestHeader, SecureChannelContext targetContext) = await m_server.CreateAndActivateSessionAsync(
+                "TransferTargetSession",
+                true,
+                clientApplicationUri: kClientApplicationUri).ConfigureAwait(false);
+            serverTestServices.SecureChannelContext = targetContext;
+            targetRequestHeader.Timestamp = DateTimeUtc.Now;
+            TransferSubscriptionsResponse response = await serverTestServices.TransferSubscriptionsAsync(
+                targetRequestHeader,
+                subscriptionIds,
+                false).ConfigureAwait(false);
+            foreach (TransferResult result in response.Results)
+            {
+                Assert.That(result.StatusCode, Is.EqualTo(StatusCodes.Good));
+            }
+            Assert.That(subscriptionManager.CaptureAbandonedPublishTimerSnapshot()
+                .Select(subscription => subscription.Id).Intersect(ids), Is.Empty,
+                "transferred subscription is still marked as abandoned");
+
+            // close the new session and delete its subscriptions
+            targetRequestHeader.Timestamp = DateTimeUtc.Now;
+            await m_server.CloseSessionAsync(targetContext, targetRequestHeader, true, RequestLifetime.None).ConfigureAwait(false);
+
+            foreach (uint id in ids)
+            {
+                Assert.That(subscriptionManager.TryGetSubscription(id, out _), Is.False);
+            }
+            Assert.That(subscriptionManager.CaptureAbandonedPublishTimerSnapshot()
+                .Select(subscription => subscription.Id).Intersect(ids), Is.Empty,
+                "deleted subscription is still held as abandoned");
+        }
+
+        /// <summary>
         /// Create a subscription with a monitored item.
         /// Create a secondary Session.
         /// Transfer subscription with a monitored item from one session to the other.
