@@ -110,7 +110,7 @@ namespace Opc.Ua.Server
                 return values[0];
             }
 
-            return values[values.Count - 1];
+            return values[^1];
         }
 
         /// <summary>
@@ -133,10 +133,11 @@ namespace Opc.Ua.Server
 
             for (int ii = 0; ii < values.Count; ii++)
             {
-                // find start value.
+                // find start value: Part 13 §5.4.3.27 uses Good raw values only, whatever
+                // TreatUncertainAsBad is (Mantis 2302, 3302, 11495).
                 DataValue start = values[ii];
 
-                if (IsGood(start))
+                if (StatusCode.IsGood(start.StatusCode))
                 {
                     try
                     {
@@ -160,7 +161,7 @@ namespace Opc.Ua.Server
                 // find end value.
                 DataValue end = values[ii];
 
-                if (IsGood(end))
+                if (StatusCode.IsGood(end.StatusCode))
                 {
                     try
                     {
@@ -231,15 +232,16 @@ namespace Opc.Ua.Server
             // return end bound.
             else
             {
-                value = values[values.Count - 1];
+                value = values[^1];
             }
 
-            // The interpolated bound is a Double. StartBound/EndBound return it in the source type,
-            // rounded half up for integer types (OPC 10000-4 §7.7.3; CTT 1.05.513 on HistorianInt1, Mantis 11494).
+            // The interpolated bound is a Double. StartBound/EndBound return it in the source type
+            // (Tables 76, 77), converted with TypeInfo.Cast as in 1.5.378 (Mantis 11494).
             value = ConvertToSourceType(value, slice);
 
-            // Part 13 Tables 76/77: a Bad bound is Bad_NoData, an Uncertain bound keeps its
-            // status; TreatUncertainAsBad does not apply to bounds (Mantis 11462).
+            // Part 13 Tables 76/77: a Bad bound is Bad_NoData and an Uncertain bound keeps its status
+            // ("Bound Uncertain: Same as bound"). TreatUncertainAsBad does not apply to bounds
+            // (Mantis 11462).
             if (!IsBoundCandidate(value))
             {
                 value.StatusCode = StatusCodes.BadNoData;
@@ -260,7 +262,7 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Converts a Double value to the source Integer type, rounding half up.
+        /// Converts an interpolated (Double) bound to the source data type (Part 13 Table 50).
         /// </summary>
         private DataValue ConvertToSourceType(DataValue value, TimeSlice slice)
         {
@@ -284,18 +286,18 @@ namespace Opc.Ua.Server
                 return value;
             }
 
-            // non-numeric (Boolean, String) cannot be SlopedInterpolated  --> BadNoData
+            // non-numeric values (Boolean, String) cannot be interpolated with a sloped line.
             if (!TypeInfo.IsNumericType(sourceType.BuiltInType))
             {
                 return GetNoDataValue(value.SourceTimestamp);
             }
 
-            if (!IsIntegerType(sourceType.BuiltInType))
+            if (sourceType.BuiltInType == BuiltInType.Double)
             {
-                return value; // Double/Float remains at it is
+                return value;
             }
 
-            object castValue = TypeInfo.Cast(RoundHalfUp(CastToDouble(value)), TypeInfo.Scalars.Double, sourceType.BuiltInType);
+            object castValue = TypeInfo.Cast(CastToDouble(value), TypeInfo.Scalars.Double, sourceType.BuiltInType);
 
             return new DataValue(new Variant(castValue, sourceType), value.StatusCode, value.SourceTimestamp, value.ServerTimestamp);
         }
@@ -327,12 +329,12 @@ namespace Opc.Ua.Server
         /// </summary>
         protected DataValue ComputeDelta2(TimeSlice slice)
         {
-            // Unrounded double bounds calculated via interpolation (no more from GetValuesWithSimpleBounds rounded list).
+            // the bounds as Double values; they are converted to the source type below.
             DataValue start = GetSimpleBound(slice.StartTime, slice, useOriginalType: false);
             DataValue end = GetSimpleBound(slice.EndTime, slice, useOriginalType: false);
 
-            // only a Bad bound gives Bad_NoData; TreatUncertainAsBad does not apply to bounds and
-            // an Uncertain bound makes the result Uncertain_DataSubNormal (Mantis 11462).
+            // Table 78: a Bad bound gives Bad_NoData and an Uncertain bound makes the result
+            // Uncertain_DataSubNormal. TreatUncertainAsBad does not apply to bounds (Mantis 11462).
             if (!IsBoundCandidate(start) || !IsBoundCandidate(end))
             {
                 return GetNoDataValue(slice);
@@ -380,18 +382,10 @@ namespace Opc.Ua.Server
 
             TypeInfo originalType = RawDataType ?? start.WrappedValue.TypeInfo;
 
-            // convert every bound to an integer type, then subtract
-            // - integer types: round each bound half up (OPC 10000-4 §7.7.3, Mantis 11494) before subtraction
-            // - double: keep the exact value
-            double delta;
-            if (originalType != null && IsIntegerType(originalType.BuiltInType))
-            {
-                delta = RoundHalfUp(endValue) - RoundHalfUp(startValue);
-            }
-            else
-            {
-                delta = endValue - startValue;
-            }
+            // the bounds are values of the source data type (StartBound and EndBound, Table 50).
+            double delta =
+                RoundToSourceType(endValue, originalType) -
+                RoundToSourceType(startValue, originalType);
 
             value.WrappedValue = CreateDeltaValue(delta, originalType);
 
@@ -401,56 +395,21 @@ namespace Opc.Ua.Server
 
         /// <summary>
         /// Returns the Delta/DeltaBounds result in the data type of the raw values (Part 13
-        /// Tables 74 and 78). A delta that does not fit into that type (a decrease of an unsigned
-        /// value, or a signed overflow) is widened to the next larger signed type, and to Double
-        /// beyond Int64/UInt64.
+        /// Table 50). A delta that does not fit into that type cannot be converted, which
+        /// GetProcessedValue reports as Bad_AggregateInvalidInputs (Table 45).
         /// </summary>
         private static Variant CreateDeltaValue(double delta, TypeInfo originalType)
         {
-            if (originalType == null ||
-                originalType.ValueRank >= 0 ||
-                !TypeInfo.IsNumericType(originalType.BuiltInType) ||
-                originalType.BuiltInType == BuiltInType.Double)
+            if (originalType != null && originalType.BuiltInType != BuiltInType.Double)
             {
-                return new Variant(delta, TypeInfo.Scalars.Double);
+                object delta2 = TypeInfo.Cast(
+                    delta,
+                    TypeInfo.Scalars.Double,
+                    originalType.BuiltInType);
+                return new Variant(delta2, originalType);
             }
 
-            BuiltInType target = GetDeltaType(originalType.BuiltInType, delta);
-
-            if (target == BuiltInType.Double)
-            {
-                return new Variant(delta, TypeInfo.Scalars.Double);
-            }
-
-            object converted = TypeInfo.Cast(delta, TypeInfo.Scalars.Double, target);
-            return new Variant(converted, new TypeInfo(target, ValueRanks.Scalar));
-        }
-
-        /// <summary>
-        /// Returns the type that can hold the delta: the source type if it fits, otherwise the
-        /// next larger signed type.
-        /// </summary>
-        private static BuiltInType GetDeltaType(BuiltInType sourceType, double delta)
-        {
-            if (FitsInType(delta, sourceType))
-            {
-                return sourceType;
-            }
-
-            switch (sourceType)
-            {
-                case BuiltInType.SByte:
-                case BuiltInType.Byte:
-                    return FitsInType(delta, BuiltInType.Int16) ? BuiltInType.Int16 : GetDeltaType(BuiltInType.Int16, delta);
-                case BuiltInType.Int16:
-                case BuiltInType.UInt16:
-                    return FitsInType(delta, BuiltInType.Int32) ? BuiltInType.Int32 : GetDeltaType(BuiltInType.Int32, delta);
-                case BuiltInType.Int32:
-                case BuiltInType.UInt32:
-                    return FitsInType(delta, BuiltInType.Int64) ? BuiltInType.Int64 : BuiltInType.Double;
-                default:
-                    return BuiltInType.Double;
-            }
+            return new Variant(delta, TypeInfo.Scalars.Double);
         }
     }
 }

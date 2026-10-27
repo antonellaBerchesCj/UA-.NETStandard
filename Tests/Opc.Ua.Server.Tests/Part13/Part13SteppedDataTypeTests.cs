@@ -13,8 +13,8 @@
  *    the value the variable exposes, because clients (and the CTT) reproduce it from there.
  *  - OPC 10000-13 §3.1.8/§3.1.9: interpolated and simple bounding values are stepped or sloped
  *    according to Stepped.
- *  - §5.4.3.6: TimeAverage always uses a sloped line; TimeAverage2, Total and Total2 follow
- *    Stepped (Total as Annex A, Historian3, and the CTT expect).
+ *  - §5.4.3.6, §5.4.3.8: TimeAverage and Total always use a sloped line; TimeAverage2 and
+ *    Total2 follow Stepped.
  *  - §5.4.2.3, Table 50: only numeric values can be interpolated with a sloped line; Boolean and
  *    String values always use the prior raw value.
  * ======================================================================*/
@@ -60,7 +60,7 @@ namespace Opc.Ua.Server.Tests.Part13
             new object[] { "TimeAverage2", 28.25, 23.5 },
             new object[] { "Total2", 565.0, 470.0 },
             new object[] { "TimeAverage", 28.25, 28.25 },
-            new object[] { "Total", 565.0, 470.0 },
+            new object[] { "Total", 565.0, 565.0 },
             new object[] { "DurationInStateZero", 5000.0, 10000.0 },
             new object[] { "DurationInStateNonZero", 15000.0, 10000.0 }
         };
@@ -68,7 +68,7 @@ namespace Opc.Ua.Server.Tests.Part13
         /// <summary>The aggregates that return the data type of the raw values (Table 50).</summary>
         private static readonly HashSet<string> s_rawTypeAggregates = new HashSet<string>(StringComparer.Ordinal) {
             "Interpolative", "StartBound", "EndBound", "DeltaBounds", "Minimum2", "Maximum2",
-            "MinimumActualTime2", "MaximumActualTime2", "Range2"
+            "MinimumActualTime2", "MaximumActualTime2"
         };
 
         /// <summary>One case per numeric data type, aggregate and Stepped value.</summary>
@@ -95,12 +95,10 @@ namespace Opc.Ua.Server.Tests.Part13
             // Boolean: false@0 s, true@10 s, false@20 s, true@30 s. String: "A", "B", "C", "D".
             // The bounds are the prior raw values: false/"A" at 5 s, false/"C" at 25 s.
             object[][] rows = {
-                new object[] { "Boolean", "Interpolative", false },
                 new object[] { "Boolean", "StartBound", false },
                 new object[] { "Boolean", "EndBound", false },
                 new object[] { "Boolean", "DurationInStateZero", 10000.0 },
                 new object[] { "Boolean", "DurationInStateNonZero", 10000.0 },
-                new object[] { "String", "Interpolative", "A" },
                 new object[] { "String", "StartBound", "A" },
                 new object[] { "String", "EndBound", "C" }
             };
@@ -154,9 +152,12 @@ namespace Opc.Ua.Server.Tests.Part13
                 Assert.That(result.Value, Is.InstanceOf<int>(), "Table 50: " + aggregateName + " returns the raw data type");
             }
 
-            if (aggregateName.StartsWith("TimeAverage", StringComparison.Ordinal) || aggregateName.StartsWith("Total", StringComparison.Ordinal))
+            // Range2 returns a Double as in 1.5.378 (Table 50 gives the raw data type; kept to avoid a
+            // breaking change for clients).
+            if (aggregateName == "Range2" ||
+                aggregateName.StartsWith("TimeAverage", StringComparison.Ordinal) || aggregateName.StartsWith("Total", StringComparison.Ordinal))
             {
-                Assert.That(result.Value, Is.InstanceOf<double>(), "Table 50: " + aggregateName + " returns a Double");
+                Assert.That(result.Value, Is.InstanceOf<double>(), aggregateName + " returns a Double");
             }
         }
         #endregion
@@ -202,6 +203,30 @@ namespace Opc.Ua.Server.Tests.Part13
             {
                 Assert.That(result.Value, Is.EqualTo(expected), aggregateName + " uses the prior raw value");
             }
+        }
+
+        /// <summary>
+        /// TimeAverage, TimeAverage2, Total and Total2 are valid for numeric data only (Table 50), so
+        /// String values give Bad_AggregateInvalidInputs (Table 45), not Good 0.
+        /// </summary>
+        [TestCase("TimeAverage")]
+        [TestCase("TimeAverage2")]
+        [TestCase("Total")]
+        [TestCase("Total2")]
+        public void StringDataGivesNoNumericResult(string aggregateName)
+        {
+            List<DataValue> raw = new List<DataValue> {
+                Raw(0, new Variant("A")),
+                Raw(10, new Variant("B")),
+                Raw(20, new Variant("C")),
+                Raw(30, new Variant("D"))
+            };
+
+            DataValue result = RunSingle(aggregateName, raw, 5, 25, 20000, false, CttConfiguration());
+
+            Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.BadAggregateInvalidInputs),
+                aggregateName + ": " + AggregateResultComparer.FormatStatus(result.StatusCode));
+            Assert.That(result.Value, Is.Null, aggregateName + " has no numeric value");
         }
         #endregion
 

@@ -224,13 +224,14 @@ namespace Opc.Ua.Server.Tests
 
         #region Count aggregates
         /// <summary>
-        /// Transition counts include Uncertain values whatever TreatUncertainAsBad is: the
-        /// definition speaks of non-Bad values and wins over TreatUncertainAsBad (Part 13
-        /// §5.4.3.24, Mantis 11425 ~0025847, 11426 ~0025852).
+        /// NumberOfTransitions uses the non-Bad values (Part 13 §5.4.3.24). The definition says
+        /// nothing about Uncertain values, so §4.2.1.2 applies: with TreatUncertainAsBad = True the
+        /// two Uncertain values count as Bad and are not transitions. Values 0..23 with Bad at 7 and
+        /// 17 and Uncertain at 9 and 19: 22 transitions, or 20 with TreatUncertainAsBad = True.
         /// </summary>
         [TestCase(false, 22)]
-        [TestCase(true, 22)]
-        public void NumberOfTransitionsCountUncertainValuesWhateverTreatUncertainAsBad(
+        [TestCase(true, 20)]
+        public void NumberOfTransitionsCountsUncertainValuesOnlyWhenUncertainIsNotBad(
             bool treatUncertainAsBad,
             int expectedTransitions)
         {
@@ -429,23 +430,21 @@ namespace Opc.Ua.Server.Tests
 
         #region Minimum, Maximum and Range (Part 13 §5.4.3.10-§5.4.3.19)
         /// <summary>
-        /// An Uncertain sample is a candidate like a Good one (Mantis 11426 ~0025852, OPC Classic
-        /// semantics): an Uncertain value outside the Good range is the extremum and makes the
-        /// result Uncertain_DataSubNormal and Calculated, the ActualTime aggregates included (CTT 1.05.513
-        /// on Historian1, 005_06 MinimumActualTime 44.46 Uncertain at 12:08:00).
+        /// Only Good samples are candidates (Part 13 §5.4.3.10-§5.4.3.14). An Uncertain sample beyond
+        /// the Good result makes it Uncertain_DataSubNormal and Calculated (Tables 58-62; Mantis 11427
+        /// ~0025875). Interval [0 s, 10 s): Good 5 at 0 s, Uncertain 1 or 9 at 5 s. The Good extremum
+        /// is 5 at the start time, the Good range 0.
         /// </summary>
-        [TestCase(Objects.AggregateFunction_Minimum, 1.0, 1.0, 0, AggregateBits.Calculated)]
-        [TestCase(Objects.AggregateFunction_Maximum, 9.0, 9.0, 0, AggregateBits.Calculated)]
-        [TestCase(Objects.AggregateFunction_Range, 1.0, 4.0, 0, AggregateBits.Calculated)]
-        [TestCase(Objects.AggregateFunction_Range, 9.0, 4.0, 0, AggregateBits.Calculated)]
-        [TestCase(Objects.AggregateFunction_MinimumActualTime, 1.0, 1.0, 5000, AggregateBits.Calculated)]
-        [TestCase(Objects.AggregateFunction_MaximumActualTime, 9.0, 9.0, 5000, AggregateBits.Calculated)]
-        public void MinMaxSelectsUncertainExtremumAndReportsUncertainStatus(
+        [TestCase(Objects.AggregateFunction_Minimum, 1.0, 5.0)]
+        [TestCase(Objects.AggregateFunction_Maximum, 9.0, 5.0)]
+        [TestCase(Objects.AggregateFunction_Range, 1.0, 0.0)]
+        [TestCase(Objects.AggregateFunction_Range, 9.0, 0.0)]
+        [TestCase(Objects.AggregateFunction_MinimumActualTime, 1.0, 5.0)]
+        [TestCase(Objects.AggregateFunction_MaximumActualTime, 9.0, 5.0)]
+        public void UncertainValueBeyondGoodExtremumMakesResultUncertain(
             uint aggregateTypeId,
             double uncertainValue,
-            double expectedValue,
-            int timestampOffset,
-            AggregateBits expectedBits)
+            double expectedValue)
         {
             DateTime start = s_baseTime;
             DateTime middle = start.AddMilliseconds(5000);
@@ -462,8 +461,39 @@ namespace Opc.Ua.Server.Tests
             Assert.That(results.Count, Is.EqualTo(1));
             Assert.That(ToDouble(results[0]), Is.EqualTo(expectedValue));
             Assert.That(results[0].StatusCode.CodeBits, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
-            Assert.That(results[0].StatusCode.AggregateBits, Is.EqualTo(expectedBits));
-            Assert.That(results[0].SourceTimestamp, Is.EqualTo(start.AddMilliseconds(timestampOffset)));
+            Assert.That(results[0].StatusCode.AggregateBits, Is.EqualTo(AggregateBits.Calculated));
+            Assert.That(results[0].SourceTimestamp, Is.EqualTo(start));
+        }
+
+        /// <summary>
+        /// An Uncertain sample inside the Good range does not change the result (Mantis 11427
+        /// ~0025875). Interval [0 s, 10 s): Good 5 at 0 s, Uncertain 9 (Minimum) or 1 (Maximum) at
+        /// 5 s. The result is the Good 5 on the start time: Good with the Raw bits (Tables 58-61).
+        /// </summary>
+        [TestCase(Objects.AggregateFunction_Minimum, 9.0)]
+        [TestCase(Objects.AggregateFunction_Maximum, 1.0)]
+        [TestCase(Objects.AggregateFunction_MinimumActualTime, 9.0)]
+        [TestCase(Objects.AggregateFunction_MaximumActualTime, 1.0)]
+        public void UncertainValueInsideGoodRangeDoesNotChangeTheResult(
+            uint aggregateTypeId,
+            double uncertainValue)
+        {
+            DateTime start = s_baseTime;
+            DateTime middle = start.AddMilliseconds(5000);
+            DateTime end = start.AddMilliseconds(10000);
+            List<DataValue> rawValues = new List<DataValue> {
+                new DataValue(new Variant(5.0), StatusCodes.Good, start, start),
+                new DataValue(new Variant(uncertainValue), StatusCodes.Uncertain, middle, middle),
+                new DataValue(new Variant(7.0), StatusCodes.Good, end, end)
+            };
+
+            List<DataValue> results = RunDirect(
+                new NodeId(aggregateTypeId), rawValues, start, end, 10000, CreateConfiguration(false));
+
+            Assert.That(results.Count, Is.EqualTo(1));
+            Assert.That(ToDouble(results[0]), Is.EqualTo(5.0));
+            Assert.That(results[0].StatusCode.CodeBits, Is.EqualTo(StatusCodes.Good));
+            Assert.That(results[0].StatusCode.AggregateBits, Is.EqualTo(AggregateBits.Raw));
         }
 
         /// <summary>
@@ -502,21 +532,19 @@ namespace Opc.Ua.Server.Tests
         }
 
         /// <summary>
-        /// A Bad sample makes the ActualTime results Uncertain (Part 13 §5.4.3.12, §5.4.3.13). The
-        /// result is the raw value with its timestamp: it keeps the Raw bit when the Bad sample has no
-        /// value (Annex A Historian2/3/5, CTT 1.05.513 on Historian3) and is Calculated when a Bad
-        /// sample carrying a value was rejected (CTT 1.05.513 on Historian1 and HistorianInteger1,
-        /// Mantis 11427).
+        /// A Bad sample makes the ActualTime results Uncertain_DataSubNormal and Calculated, with or
+        /// without a value: Calculated is set when the status was set to Uncertain because of
+        /// non-Good values (Part 13 Tables 60, 61; Mantis 11427 ~0025875). The data starts at 1 s,
+        /// inside the interval, so Partial is set too (§5.3.3.2).
         /// </summary>
-        [TestCase(Objects.AggregateFunction_MinimumActualTime, 5.0, false, AggregateBits.Raw)]
-        [TestCase(Objects.AggregateFunction_MaximumActualTime, 10.0, false, AggregateBits.Raw)]
-        [TestCase(Objects.AggregateFunction_MinimumActualTime, 5.0, true, AggregateBits.Calculated)]
-        [TestCase(Objects.AggregateFunction_MaximumActualTime, 10.0, true, AggregateBits.Calculated)]
-        public void BadSampleMakesActualTimeResultUncertain(
+        [TestCase(Objects.AggregateFunction_MinimumActualTime, 5.0, false)]
+        [TestCase(Objects.AggregateFunction_MaximumActualTime, 10.0, false)]
+        [TestCase(Objects.AggregateFunction_MinimumActualTime, 5.0, true)]
+        [TestCase(Objects.AggregateFunction_MaximumActualTime, 10.0, true)]
+        public void BadSampleMakesActualTimeResultUncertainAndCalculated(
             uint aggregateTypeId,
             double expectedValue,
-            bool badSampleHasValue,
-            AggregateBits expectedBits)
+            bool badSampleHasValue)
         {
             DateTime start = s_baseTime;
             DateTime minimum = start.AddMilliseconds(1000);
@@ -536,28 +564,26 @@ namespace Opc.Ua.Server.Tests
             Assert.That(results.Count, Is.EqualTo(1));
             Assert.That(ToDouble(results[0]), Is.EqualTo(expectedValue));
             Assert.That(results[0].StatusCode.CodeBits, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
-            Assert.That(
-                results[0].StatusCode.AggregateBits & AggregateBits.Calculated,
-                Is.EqualTo(expectedBits));
+            Assert.That(results[0].StatusCode.AggregateBits, Is.EqualTo(AggregateBits.Calculated | AggregateBits.Partial));
         }
 
         /// <summary>
-        /// An interval holding only Uncertain samples returns the Uncertain extremum with
-        /// Uncertain_DataSubNormal whatever TreatUncertainAsBad is (Mantis 11426 ~0025852).
+        /// An interval holding only Uncertain samples has no Good minimum or maximum, so the result
+        /// is Bad_NoData whatever TreatUncertainAsBad is (Part 13 §5.4.3.10-§5.4.3.14; Annex A
+        /// Historian1 at 12:01:04).
         /// </summary>
-        [TestCase(Objects.AggregateFunction_Minimum, false, 5.0)]
-        [TestCase(Objects.AggregateFunction_Maximum, false, 5.0)]
-        [TestCase(Objects.AggregateFunction_Range, false, 0.0)]
-        [TestCase(Objects.AggregateFunction_MinimumActualTime, false, 5.0)]
-        [TestCase(Objects.AggregateFunction_MaximumActualTime, false, 5.0)]
-        [TestCase(Objects.AggregateFunction_Minimum, true, 5.0)]
-        [TestCase(Objects.AggregateFunction_Maximum, true, 5.0)]
-        [TestCase(Objects.AggregateFunction_Range, true, 0.0)]
-        [TestCase(Objects.AggregateFunction_MinimumActualTime, true, 5.0)]
-        public void AllUncertainIntervalReturnsUncertainExtremum(
+        [TestCase(Objects.AggregateFunction_Minimum, false)]
+        [TestCase(Objects.AggregateFunction_Maximum, false)]
+        [TestCase(Objects.AggregateFunction_Range, false)]
+        [TestCase(Objects.AggregateFunction_MinimumActualTime, false)]
+        [TestCase(Objects.AggregateFunction_MaximumActualTime, false)]
+        [TestCase(Objects.AggregateFunction_Minimum, true)]
+        [TestCase(Objects.AggregateFunction_Maximum, true)]
+        [TestCase(Objects.AggregateFunction_Range, true)]
+        [TestCase(Objects.AggregateFunction_MinimumActualTime, true)]
+        public void IntervalWithoutGoodValueReturnsBadNoData(
             uint aggregateTypeId,
-            bool treatUncertainAsBad,
-            double expectedValue)
+            bool treatUncertainAsBad)
         {
             DateTime start = s_baseTime;
             DateTime end = start.AddMilliseconds(10000);
@@ -570,11 +596,8 @@ namespace Opc.Ua.Server.Tests
                 new NodeId(aggregateTypeId), rawValues, start, end, 10000, CreateConfiguration(treatUncertainAsBad));
 
             Assert.That(results.Count, Is.EqualTo(1));
-            Assert.That(ToDouble(results[0]), Is.EqualTo(expectedValue));
-            Assert.That(results[0].StatusCode.CodeBits, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
-            Assert.That(
-                results[0].StatusCode.AggregateBits & AggregateBits.Calculated,
-                Is.EqualTo(AggregateBits.Calculated));
+            Assert.That(results[0].Value, Is.Null);
+            Assert.That(results[0].StatusCode.CodeBits, Is.EqualTo(StatusCodes.BadNoData));
         }
 
         /// <summary>
@@ -606,25 +629,26 @@ namespace Opc.Ua.Server.Tests
 
         #region Bounding values (Part 13 §3.1.8, §3.1.9)
         /// <summary>
-        /// TreatUncertainAsBad never applies to bounding values (Mantis 11462): an Uncertain raw
-        /// value next to the timestamp is a bound candidate and makes the bound
-        /// Uncertain_DataSubNormal, it is neither skipped nor turned into Bad_NoData.
+        /// TreatUncertainAsBad does not apply to bounding values (WG answer to Mantis 11462): an
+        /// Uncertain raw value is used and makes the bound Uncertain_DataSubNormal (Part 13 §3.1.8,
+        /// §3.1.9). Raw data: Good 0 (0 s), Uncertain 10 (10 s), Good 40 (20 s), Good 50 (30 s);
+        /// interval [5 s, 15 s). Whatever TreatUncertainAsBad is, the start bound lies between 0 and
+        /// 10 -> 5 and the end bound between 10 and 40 -> 25, both Uncertain_DataSubNormal;
+        /// DeltaBounds 20 (Table 78).
         /// </summary>
-        [TestCase("StartBound", true, 5.0)]
         [TestCase("StartBound", false, 5.0)]
-        [TestCase("EndBound", true, 25.0)]
         [TestCase("EndBound", false, 25.0)]
-        [TestCase("DeltaBounds", true, 20.0)]
         [TestCase("DeltaBounds", false, 20.0)]
-        [TestCase("Interpolative", true, 5.0)]
         [TestCase("Interpolative", false, 5.0)]
-        public void UncertainNeighbourMakesBoundUncertainWhateverTreatUncertainAsBad(
+        [TestCase("StartBound", true, 5.0)]
+        [TestCase("EndBound", true, 25.0)]
+        [TestCase("DeltaBounds", true, 20.0)]
+        [TestCase("Interpolative", true, 5.0)]
+        public void TreatUncertainAsBadDoesNotApplyToAnUncertainNeighbourOfTheBound(
             string aggregateName,
             bool treatUncertainAsBad,
             double expected)
         {
-            // Interval [5 s, 15 s): the start bound lies between Good 0 (0 s) and Uncertain 10
-            // (10 s) -> 5; the end bound between Uncertain 10 (10 s) and Good 40 (20 s) -> 25.
             List<DataValue> rawValues = new List<DataValue> {
                 CreateValue(0, StatusCodes.Good, 0),
                 CreateValue(10, StatusCodes.UncertainSubstituteValue, 10),

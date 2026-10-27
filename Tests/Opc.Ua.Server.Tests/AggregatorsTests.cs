@@ -41,12 +41,13 @@ namespace Opc.Ua.Server.Tests
     [Parallelizable]
     public class AggregatorsTests
     {
-        private AggregateConfiguration m_configuration;
         private ITelemetryContext m_telemetry;
+        private AggregateConfiguration m_configuration;
 
         [SetUp]
         public void SetUp()
         {
+            m_telemetry = NUnitTelemetryContext.Create();
             m_configuration = new AggregateConfiguration
             {
                 TreatUncertainAsBad = false,
@@ -54,24 +55,21 @@ namespace Opc.Ua.Server.Tests
                 PercentDataGood = 100,
                 UseSlopedExtrapolation = false
             };
-
-            m_telemetry = NUnitTelemetryContext.Create();
         }
 
         [Test]
         public void GetDefaultConfigurationTreatsUncertainAsBadByDefault()
         {
             var server = new Mock<IServerInternal>();
-            using (var manager = new AggregateManager(server.Object))
-            {
-                AggregateConfiguration config = manager.GetDefaultConfiguration(default);
+            using var manager = new AggregateManager(server.Object);
 
-                // Part 13 v1.05.07 §4.2.1.2: the TreatUncertainAsBad default is True.
-                Assert.That(config.TreatUncertainAsBad, Is.True);
-                Assert.That(config.PercentDataBad, Is.EqualTo(100));
-                Assert.That(config.PercentDataGood, Is.EqualTo(100));
-                Assert.That(config.UseSlopedExtrapolation, Is.False);
-            }
+            AggregateConfiguration config = manager.GetDefaultConfiguration(default);
+
+            // Part 13 v1.05.07 §4.2.1.2: the TreatUncertainAsBad default is True.
+            Assert.That(config.TreatUncertainAsBad, Is.True);
+            Assert.That(config.PercentDataBad, Is.EqualTo(100));
+            Assert.That(config.PercentDataGood, Is.EqualTo(100));
+            Assert.That(config.UseSlopedExtrapolation, Is.False);
         }
 
         [Test]
@@ -135,8 +133,7 @@ namespace Opc.Ua.Server.Tests
         public void GetNameForStandardAggregateReturnsDefaultForUnknownId()
         {
             QualifiedName name = Aggregators.GetNameForStandardAggregate(new NodeId(999999));
-            // 1.4.371: NUnit 3.13 has no Is.Default; QualifiedName is a class, so default is null.
-            Assert.That(name, Is.Null);
+            Assert.That(name, Is.Default);
         }
 
         [Test]
@@ -183,8 +180,7 @@ namespace Opc.Ua.Server.Tests
         public void GetIdForStandardAggregateReturnsDefaultForUnknownName()
         {
             NodeId id = Aggregators.GetIdForStandardAggregate(new QualifiedName("NonExistentAggregate"));
-            // 1.4.371: NUnit 3.13 has no Is.Default; NodeId is a class, so default is null.
-            Assert.That(id, Is.Null);
+            Assert.That(id, Is.Default);
         }
 
         [Test]
@@ -715,8 +711,8 @@ namespace Opc.Ua.Server.Tests
         [Test]
         public void GetNameAndIdAreConsistentForAllMappings()
         {
-            NodeId[] aggregateIds = new NodeId[]
-            {
+            NodeId[] aggregateIds =
+            [
                 ObjectIds.AggregateFunction_Interpolative,
                 ObjectIds.AggregateFunction_Average,
                 ObjectIds.AggregateFunction_TimeAverage,
@@ -739,13 +735,12 @@ namespace Opc.Ua.Server.Tests
                 ObjectIds.AggregateFunction_PercentBad,
                 ObjectIds.AggregateFunction_WorstQuality,
                 ObjectIds.AggregateFunction_WorstQuality2
-            };
+            ];
 
             foreach (NodeId aggregateId in aggregateIds)
             {
                 QualifiedName name = Aggregators.GetNameForStandardAggregate(aggregateId);
-                // 1.4.371: NUnit 3.13 has no Is.Not.Default; QualifiedName is a class, so not default is not null.
-                Assert.That(name, Is.Not.Null,
+                Assert.That(name, Is.Not.Default,
                     $"Name should be found for aggregate {aggregateId}");
 
                 NodeId roundTrippedId = Aggregators.GetIdForStandardAggregate(name);

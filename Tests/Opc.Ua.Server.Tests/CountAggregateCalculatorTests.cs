@@ -41,12 +41,13 @@ namespace Opc.Ua.Server.Tests
     [Parallelizable]
     public class CountAggregateCalculatorTests
     {
-        private AggregateConfiguration m_configuration;
         private ITelemetryContext m_telemetry;
+        private AggregateConfiguration m_configuration;
 
         [SetUp]
         public void SetUp()
         {
+            m_telemetry = NUnitTelemetryContext.Create();
             m_configuration = new AggregateConfiguration
             {
                 TreatUncertainAsBad = false,
@@ -54,8 +55,6 @@ namespace Opc.Ua.Server.Tests
                 PercentDataGood = 100,
                 UseSlopedExtrapolation = false
             };
-
-            m_telemetry = NUnitTelemetryContext.Create();
         }
 
         private static List<DataValue> CreateDataValues(
@@ -126,7 +125,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 10, 20, 30, 40, 50, 50 };
+            double[] values = [10, 20, 30, 40, 50, 50];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -145,16 +144,16 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 10, 20, 30, 40, 50, 50 };
-            StatusCode[] statuses = new StatusCode[]
-            {
+            double[] values = [10, 20, 30, 40, 50, 50];
+            StatusCode[] statuses =
+            [
                 StatusCodes.Good,
                 StatusCodes.Bad,
                 StatusCodes.Good,
                 StatusCodes.Bad,
                 StatusCodes.Good,
                 StatusCodes.Good
-            };
+            ];
             List<DataValue> dataValues = CreateMixedStatusDataValues(
                 firstValueTime, values, statuses, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
@@ -174,7 +173,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 42, 42 };
+            double[] values = [42, 42];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(4000);
 
@@ -186,12 +185,15 @@ namespace Opc.Ua.Server.Tests
             Assert.That(result.WrappedValue.IsNull, Is.False);
         }
 
+        /// <summary>
+        /// AnnotationCount counts Annotations, not raw values (Part 13 §5.4.3.20); none were queued.
+        /// </summary>
         [Test]
-        public void AnnotationCountReturnsCountOfAllValues()
+        public void AnnotationCountWithoutAnnotationsReturnsZero()
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 10, 20, 30, 40, 50, 50 };
+            double[] values = [10, 20, 30, 40, 50, 50];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -202,24 +204,29 @@ namespace Opc.Ua.Server.Tests
             Assert.That(result, Is.Not.Null);
             Assert.That(result.WrappedValue.IsNull, Is.False);
             int count = (int)(double)result.WrappedValue.ConvertToDouble();
-            Assert.That(count, Is.GreaterThan(0));
+            Assert.That(count, Is.Zero);
+            Assert.That(StatusCode.IsGood(result.StatusCode), Is.True);
         }
 
+        /// <summary>
+        /// AnnotationCount does not count raw values of any status (Part 13 §5.4.3.20), while Count
+        /// counts the Good ones.
+        /// </summary>
         [Test]
-        public void AnnotationCountIncludesBadValues()
+        public void AnnotationCountDoesNotCountRawValues()
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 10, 20, 30, 40, 50, 50 };
-            StatusCode[] statuses = new StatusCode[]
-            {
+            double[] values = [10, 20, 30, 40, 50, 50];
+            StatusCode[] statuses =
+            [
                 StatusCodes.Good,
                 StatusCodes.Bad,
                 StatusCodes.Good,
                 StatusCodes.Bad,
                 StatusCodes.Good,
                 StatusCodes.Good
-            };
+            ];
             List<DataValue> dataValues = CreateMixedStatusDataValues(
                 firstValueTime, values, statuses, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
@@ -236,7 +243,8 @@ namespace Opc.Ua.Server.Tests
             Assert.That(countResult, Is.Not.Null);
             int annotationCount = (int)(double)annotationResult.WrappedValue.ConvertToDouble();
             int goodCount = (int)(double)countResult.WrappedValue.ConvertToDouble();
-            Assert.That(annotationCount, Is.GreaterThanOrEqualTo(goodCount));
+            Assert.That(annotationCount, Is.Zero);
+            Assert.That(goodCount, Is.GreaterThan(0));
         }
 
         [Test]
@@ -244,7 +252,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 0, 0, 1, 0, 0, 0 };
+            double[] values = [0, 0, 1, 0, 0, 0];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -263,7 +271,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 1, 1, 0, 1, 1, 1 };
+            double[] values = [1, 1, 0, 1, 1, 1];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -282,7 +290,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 1, 2, 3, 4, 5, 5 };
+            double[] values = [1, 2, 3, 4, 5, 5];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -301,7 +309,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 0, 0, 0, 0, 0, 0 };
+            double[] values = [0, 0, 0, 0, 0, 0];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -320,7 +328,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 0, 1, 0, 1, 0, 0 };
+            double[] values = [0, 1, 0, 1, 0, 0];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -339,7 +347,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 5, 5, 5, 5, 5, 5 };
+            double[] values = [5, 5, 5, 5, 5, 5];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -358,7 +366,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 0, 0, 0, 1, 1, 1 };
+            double[] values = [0, 0, 0, 1, 1, 1];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -378,7 +386,7 @@ namespace Opc.Ua.Server.Tests
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             List<DataValue> dataValues = CreateDataValues(
                 startTime.AddMilliseconds(-500),
-                new double[] { 5, 5, 5, 5 },
+                [5, 5, 5, 5],
                 1000);
             DateTime endTime = startTime.AddMilliseconds(2500);
 
@@ -394,21 +402,22 @@ namespace Opc.Ua.Server.Tests
         }
 
         /// <summary>
-        /// Verifies that transition counting uses a preceding uncertain value as the previous non-Bad value
-        /// whatever TreatUncertainAsBad is (Part 13 §5.4.3.24 speaks of non-Bad values; the aggregate
-        /// definition wins over TreatUncertainAsBad, Mantis 11425 ~0025847, 11426 ~0025852).
+        /// NumberOfTransitions compares the first value with "a non-Bad value prior to the interval"
+        /// (Part 13 Table 72, Use Bounds), and TreatUncertainAsBad does not apply to bounds (WG
+        /// answer to Mantis 11462). The Uncertain 5 before the interval is the previous value
+        /// whatever TreatUncertainAsBad is, so the first value 5 is no transition (6: 1).
         /// </summary>
-        [TestCase(false, 1)]
         [TestCase(true, 1)]
-        public void NumberOfTransitionsUsesPreviousUncertainValueWhateverTreatUncertainAsBad(
+        [TestCase(false, 1)]
+        public void NumberOfTransitionsUsesAnUncertainPreviousValueWhateverTreatUncertainAsBad(
             bool treatUncertainAsBad,
             int expected)
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             List<DataValue> dataValues = CreateMixedStatusDataValues(
                 startTime.AddMilliseconds(-500),
-                new double[] { 5, 5, 6, 7 },
-                new StatusCode[] { StatusCodes.Uncertain, StatusCodes.Good, StatusCodes.Good, StatusCodes.Good },
+                [5, 5, 6, 7],
+                [StatusCodes.Uncertain, StatusCodes.Good, StatusCodes.Good, StatusCodes.Good],
                 1000);
             DateTime endTime = startTime.AddMilliseconds(2500);
             m_configuration.TreatUncertainAsBad = treatUncertainAsBad;
@@ -429,7 +438,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 0, 1, 0, 1, 0, 1 };
+            double[] values = [0, 1, 0, 1, 0, 1];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -454,7 +463,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 10, 20, 30, 40, 50, 50 };
+            double[] values = [10, 20, 30, 40, 50, 50];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(12000);
 
@@ -471,7 +480,7 @@ namespace Opc.Ua.Server.Tests
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
             DateTime firstValueTime = startTime.AddMilliseconds(500);
-            double[] values = new double[] { 10, 20, 30, 30 };
+            double[] values = [10, 20, 30, 30];
             List<DataValue> dataValues = CreateDataValues(firstValueTime, values, 2000);
             DateTime endTime = startTime.AddMilliseconds(8000);
 

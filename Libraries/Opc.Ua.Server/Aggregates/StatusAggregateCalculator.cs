@@ -141,9 +141,16 @@ namespace Opc.Ua.Server
                 }
             }
 
+            // Mantis 11499: Part 13 will say that Duration values are rounded,
+            // without fixing the algorithm. DurationGood/DurationBad are rounded to whole milliseconds,
+            // half to even as TypeInfo.Cast rounds; PercentGood/PercentBad use the unrounded durations.
             if (usePercent)
             {
                 duration = duration / total * 100;
+            }
+            else
+            {
+                duration = Math.Round(duration, MidpointRounding.ToEven);
             }
 
             // set the timestamp and status.
@@ -167,11 +174,11 @@ namespace Opc.Ua.Server
             // get the values in the slice.
             List<DataValue> values = GetValues(slice);
 
-            // Part 13 WorstQuality2 includes the start bound only (Mantis 11422). The
-            // simple bound is built from non-Bad raw values whatever TreatUncertainAsBad is
-            // (Mantis 11462). Part 13 §5.4.2.2: a backward interval is calculated like the forward
-            // interval covering the same time range, so the start bound is always taken at the
-            // early time of the slice and the values (always chronological) keep their order.
+            // Part 13 §5.4.3.36: WorstQuality2 includes the start bound only and ignores
+            // TreatUncertainAsBad (which never applies to bounds, Mantis 11462). §5.4.2.2: a
+            // backward interval is calculated like the forward interval covering the same time
+            // range, so the start bound is always taken at the early time of the slice and the
+            // values (always chronological) keep their order.
             if (includeBounds && values != null)
             {
                 DateTime startTime = slice.StartTime;

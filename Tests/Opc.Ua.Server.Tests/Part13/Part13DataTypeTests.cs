@@ -28,35 +28,23 @@ namespace Opc.Ua.Server.Tests.Part13
     {
         private static readonly DateTime s_t0 = new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-        #region Delta and DeltaBounds (Tables 74, 78)
+        #region Delta and DeltaBounds (Table 50)
         /// <summary>
-        /// Delta and DeltaBounds return the data type of the raw values. A delta that does not fit
-        /// into that type (a decrease of an unsigned value, or a signed overflow) is returned in the
-        /// next larger signed type; beyond Int64/UInt64 it is returned as Double. Raw: start value
+        /// Delta and DeltaBounds return the data type of the raw values (Table 50). Raw: start value
         /// at 0 s, end value at 5 s, 10 s and 20 s; interval [0 s, 10 s). Delta uses the first and
         /// last raw values in the interval (0 s, 5 s); DeltaBounds uses the bounds (0 s, 10 s).
         /// </summary>
-        [TestCase("Delta", BuiltInType.Byte, 10.0, 20.0, BuiltInType.Byte, 10.0)]
-        [TestCase("Delta", BuiltInType.Byte, 20.0, 10.0, BuiltInType.Int16, -10.0)]
-        [TestCase("Delta", BuiltInType.SByte, -100.0, 100.0, BuiltInType.Int16, 200.0)]
-        [TestCase("Delta", BuiltInType.UInt16, 20.0, 10.0, BuiltInType.Int32, -10.0)]
-        [TestCase("Delta", BuiltInType.Int32, 10.0, 25.0, BuiltInType.Int32, 15.0)]
-        [TestCase("Delta", BuiltInType.UInt32, 10.0, 5.0, BuiltInType.Int64, -5.0)]
-        [TestCase("Delta", BuiltInType.Int32, -2000000000.0, 2000000000.0, BuiltInType.Int64, 4000000000.0)]
-        [TestCase("Delta", BuiltInType.UInt64, 10.0, 5.0, BuiltInType.Double, -5.0)]
-        [TestCase("Delta", BuiltInType.Double, 10.5, 5.25, BuiltInType.Double, -5.25)]
-        [TestCase("DeltaBounds", BuiltInType.Byte, 10.0, 20.0, BuiltInType.Byte, 10.0)]
-        [TestCase("DeltaBounds", BuiltInType.Byte, 20.0, 10.0, BuiltInType.Int16, -10.0)]
-        [TestCase("DeltaBounds", BuiltInType.UInt16, 20.0, 10.0, BuiltInType.Int32, -10.0)]
-        [TestCase("DeltaBounds", BuiltInType.UInt32, 10.0, 5.0, BuiltInType.Int64, -5.0)]
-        [TestCase("DeltaBounds", BuiltInType.Int32, -2000000000.0, 2000000000.0, BuiltInType.Int64, 4000000000.0)]
-        [TestCase("DeltaBounds", BuiltInType.UInt64, 10.0, 5.0, BuiltInType.Double, -5.0)]
-        public void DeltaKeepsTheRawDataTypeOrWidensIt(
+        [TestCase("Delta", BuiltInType.Byte, 10.0, 20.0, 10.0)]
+        [TestCase("Delta", BuiltInType.Int32, 10.0, 25.0, 15.0)]
+        [TestCase("Delta", BuiltInType.Int16, 20.0, 10.0, -10.0)]
+        [TestCase("Delta", BuiltInType.Double, 10.5, 5.25, -5.25)]
+        [TestCase("DeltaBounds", BuiltInType.Byte, 10.0, 20.0, 10.0)]
+        [TestCase("DeltaBounds", BuiltInType.Int32, 10.0, 25.0, 15.0)]
+        public void DeltaKeepsTheRawDataType(
             string aggregateName,
             BuiltInType sourceType,
             double startValue,
             double endValue,
-            BuiltInType expectedType,
             double expectedValue)
         {
             List<DataValue> raw = new List<DataValue> {
@@ -68,31 +56,65 @@ namespace Opc.Ua.Server.Tests.Part13
 
             DataValue result = RunSingle(aggregateName, raw, 0, 10, false, Config(false));
 
-            AssertType(result, expectedType, aggregateName);
+            AssertType(result, sourceType, aggregateName);
             AssertValue(result, expectedValue, aggregateName);
+        }
+
+        /// <summary>
+        /// A delta that does not fit into the data type of the raw values (a decrease of an unsigned
+        /// value, or an overflow) cannot be converted to the result data type (Table 50), which is
+        /// Bad_AggregateInvalidInputs (Table 45: errors attempting to perform data conversions).
+        /// </summary>
+        [TestCase("Delta", BuiltInType.Byte, 20.0, 10.0)]
+        [TestCase("Delta", BuiltInType.SByte, -100.0, 100.0)]
+        [TestCase("Delta", BuiltInType.UInt16, 20.0, 10.0)]
+        [TestCase("Delta", BuiltInType.UInt32, 10.0, 5.0)]
+        [TestCase("Delta", BuiltInType.Int32, -2000000000.0, 2000000000.0)]
+        [TestCase("Delta", BuiltInType.UInt64, 10.0, 5.0)]
+        [TestCase("DeltaBounds", BuiltInType.Byte, 20.0, 10.0)]
+        [TestCase("DeltaBounds", BuiltInType.UInt16, 20.0, 10.0)]
+        [TestCase("DeltaBounds", BuiltInType.UInt32, 10.0, 5.0)]
+        [TestCase("DeltaBounds", BuiltInType.Int32, -2000000000.0, 2000000000.0)]
+        [TestCase("DeltaBounds", BuiltInType.UInt64, 10.0, 5.0)]
+        public void DeltaThatDoesNotFitTheRawDataTypeIsAnInvalidInput(
+            string aggregateName,
+            BuiltInType sourceType,
+            double startValue,
+            double endValue)
+        {
+            List<DataValue> raw = new List<DataValue> {
+                Typed(0, sourceType, startValue),
+                Typed(5, sourceType, endValue),
+                Typed(10, sourceType, endValue),
+                Typed(20, sourceType, endValue)
+            };
+
+            DataValue result = RunSingle(aggregateName, raw, 0, 10, false, Config(false));
+
+            Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.BadAggregateInvalidInputs), aggregateName);
+            Assert.That(result.Value, Is.Null, aggregateName);
         }
         #endregion
 
-        #region Range and Range2 (Tables 62, 67)
+        #region Range and Range2 (Double, as in 1.5.378)
         /// <summary>
-        /// Range and Range2 return the data type of the raw values; a range that does not fit into
-        /// that type is returned as Double. Stepped raw values: minimum or maximum at 0 s, the other
-        /// one at 5 s, the same value again at 20 s, so the bounds of Range2 equal the raw values.
+        /// Range and Range2 return a Double, as in 1.5.378. Table 50 gives the raw data type; the
+        /// result type is kept because changing it would break clients. Stepped raw values: minimum
+        /// or maximum at 0 s, the other one at 5 s, the same value again at 20 s, so the bounds of
+        /// Range2 equal the raw values. A Double also holds ranges that do not fit the raw type
+        /// (SByte -100 to 100: 200).
         /// </summary>
-        [TestCase("Range", BuiltInType.Int32, 10.0, 30.0, BuiltInType.Int32, 20.0)]
-        [TestCase("Range", BuiltInType.UInt16, 5.0, 60000.0, BuiltInType.UInt16, 59995.0)]
-        [TestCase("Range", BuiltInType.SByte, -100.0, 100.0, BuiltInType.Double, 200.0)]
-        [TestCase("Range", BuiltInType.Int32, -2000000000.0, 2000000000.0, BuiltInType.Double, 4000000000.0)]
-        [TestCase("Range2", BuiltInType.Int32, 10.0, 30.0, BuiltInType.Int32, 20.0)]
-        [TestCase("Range2", BuiltInType.UInt16, 5.0, 60000.0, BuiltInType.UInt16, 59995.0)]
-        [TestCase("Range2", BuiltInType.SByte, -100.0, 100.0, BuiltInType.Double, 200.0)]
-        [TestCase("Range2", BuiltInType.Int32, -2000000000.0, 2000000000.0, BuiltInType.Double, 4000000000.0)]
-        public void RangeKeepsTheRawDataTypeOrReturnsDouble(
+        [TestCase("Range", BuiltInType.Int32, 10.0, 30.0, 20.0)]
+        [TestCase("Range", BuiltInType.UInt16, 5.0, 60000.0, 59995.0)]
+        [TestCase("Range", BuiltInType.SByte, -100.0, 100.0, 200.0)]
+        [TestCase("Range2", BuiltInType.Int32, 10.0, 30.0, 20.0)]
+        [TestCase("Range2", BuiltInType.UInt16, 5.0, 60000.0, 59995.0)]
+        [TestCase("Range2", BuiltInType.SByte, -100.0, 100.0, 200.0)]
+        public void RangeReturnsDoubleAsIn1_5_378(
             string aggregateName,
             BuiltInType sourceType,
             double firstValue,
             double secondValue,
-            BuiltInType expectedType,
             double expectedValue)
         {
             List<DataValue> raw = new List<DataValue> {
@@ -103,53 +125,61 @@ namespace Opc.Ua.Server.Tests.Part13
 
             DataValue result = RunSingle(aggregateName, raw, 0, 10, true, Config(false));
 
-            AssertType(result, expectedType, aggregateName);
+            AssertType(result, BuiltInType.Double, aggregateName);
             AssertValue(result, expectedValue, aggregateName);
         }
         #endregion
 
-        #region Integer conversion of interpolated values (OPC 10000-4 §7.7.3, Mantis 11494)
+        #region Integer conversion of interpolated values (Mantis 11494, 11499)
         /// <summary>
         /// Interpolative returns the raw data type (Table 50) and rounds an interpolated value of an
-        /// integer variable instead of truncating it (Mantis 11494, 11499). Int32 raw 0@0 and 5@10 give
-        /// 2.5 at 5 s, which is 3 (truncation and banker's rounding would give 2). A positive .5 is used
-        /// because the rounding rule for a negative .5 is not defined (Mantis 11518).
+        /// integer variable instead of truncating it (Mantis 11494, 11499). Int32 raw 0@0 and 8@10
+        /// give 4.8 at 6 s, which is 5 (truncation would give 4). A value away from .5 is used because
+        /// Part 13 does not fix the rule at .5 (Mantis 11518).
         /// </summary>
         [Test]
         public void InterpolativeRoundsInsteadOfTruncating()
         {
             List<DataValue> raw = new List<DataValue> {
                 Typed(0, BuiltInType.Int32, 0),
-                Typed(10, BuiltInType.Int32, 5),
-                Typed(20, BuiltInType.Int32, 5)
+                Typed(10, BuiltInType.Int32, 8),
+                Typed(20, BuiltInType.Int32, 8)
             };
 
-            DataValue result = RunSingle("Interpolative", raw, 5, 6, false, Config(false));
+            DataValue result = RunSingle("Interpolative", raw, 6, 7, false, Config(false));
 
             AssertType(result, BuiltInType.Int32, "Interpolative");
-            AssertValue(result, 3, "2.5 rounded, not truncated");
+            AssertValue(result, 5, "4.8 rounded, not truncated");
         }
-
         /// <summary>
-        /// StartBound of an Int32 variable rounds a negative half up as well: raw 0@0 and -5@10 give
-        /// -2.5 at 5 s, which is -2 (adding 0.5 gives -2.0; rounding away from zero would give -3).
-        /// This is the rule of RoundHalfUp; Part 13 does not define the negative .5 case (Mantis 11518).
+        /// Part 13 does not define how an interpolated value of an integer variable is rounded at .5
+        /// (Mantis 11518, no answer; Mantis 11499: "values should be rounded (without specifying the
+        /// algorithm)"), so the 1.5.378 conversion is kept: TypeInfo.Cast rounds to the nearest value
+        /// and a tie to the even value. Raw 0 at 0 ms and the given value at 1024 ms give exactly half
+        /// of it at 512 ms (a power-of-two range keeps the tie exact): 2.5 gives 2 (round half up: 3),
+        /// 1.5 gives 2 (truncation: 1).
         /// </summary>
-        [Test]
-        public void StartBoundRoundsANegativeHalfUp()
+        [TestCase(5.0, 2.0)]
+        [TestCase(-5.0, -2.0)]
+        [TestCase(3.0, 2.0)]
+        [TestCase(7.0, 4.0)]
+        public void StartBoundKeepsTheTypeInfoCastRuleAtHalf(double valueAt1024Milliseconds, double expected)
         {
             List<DataValue> raw = new List<DataValue> {
                 Typed(0, BuiltInType.Int32, 0),
-                Typed(10, BuiltInType.Int32, -5),
-                Typed(20, BuiltInType.Int32, -5)
+                Typed(1.024, BuiltInType.Int32, valueAt1024Milliseconds),
+                Typed(2.048, BuiltInType.Int32, valueAt1024Milliseconds)
             };
 
-            DataValue result = RunSingle("StartBound", raw, 5, 6, false, Config(false));
+            // ProcessingInterval 0: one interval for the whole range [512 ms, 768 ms).
+            List<DataValue> results = AggregateCalculatorRunner.Run(
+                ObjectIds.AggregateFunction_StartBound, raw, At(0.512), At(0.768), 0, false, Config(false));
 
-            AssertType(result, BuiltInType.Int32, "StartBound");
-            AssertValue(result, -2, "-2.5 rounded half up");
+            Assert.That(results.Count, Is.EqualTo(1));
+            AssertType(results[0], BuiltInType.Int32, "StartBound");
+            AssertValue(results[0], expected, "ties to even, as in 1.5.378");
         }
-        #endregion
+       #endregion
 
         #region TimeAverage2 and Total2 without usable data (§5.4.3.7, §5.4.3.9)
         /// <summary>

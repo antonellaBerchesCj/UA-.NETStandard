@@ -119,7 +119,7 @@ namespace Opc.Ua.Server
 
             for (int ii = 0; ii < values.Count; ii++)
             {
-                // Mantis 11495 answer (12.10.2026): the Count definition (5.4.3.21) overrides the
+                // Mantis 11495: the Count definition (5.4.3.21) overrides the
                 // general rule of 4.2.1.2. Only Good values are counted, whatever TreatUncertainAsBad
                 // is; non-Good values only affect the StatusCode (value-based, 5.4.3), where an
                 // Uncertain value is not Good. A count of 0 means that there is no Good data.
@@ -136,7 +136,7 @@ namespace Opc.Ua.Server
                 SourceTimestamp = GetTimestamp(slice),
                 ServerTimestamp = GetTimestamp(slice)
             };
-            value.StatusCode = GetValueBasedStatusCode(slice, values, value.StatusCode, uncertainIsGood: false);
+            value.StatusCode = GetValueBasedStatusCode(slice, values, value.StatusCode);
 
             if (!StatusCode.IsBad(value.StatusCode))
             {
@@ -148,26 +148,22 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Calculates the AnnotationCount aggregate for the timeslice.
+        /// Calculates the AnnotationCount aggregate for the timeslice: the number of Annotations in
+        /// the interval (Part 13 §5.4.3.20), which the history layer passes to
+        /// <see cref="AggregateCalculator.QueueAnnotation"/>. Raw values are not counted; they only
+        /// decide whether the interval is before the start or after the end of data, which is
+        /// Bad_NoData (Table 68).
         /// </summary>
         protected DataValue ComputeAnnotationCount(TimeSlice slice)
         {
-            // get the values in the slice.
-            List<DataValue> values = GetValues(slice);
-
-            // check for empty slice.
-            if (values == null)
+            // check for an interval before the start or after the end of data.
+            if (IsBeyondData(slice))
             {
                 return GetNoDataValue(slice);
             }
 
-            // count the values.
-            int count = 0;
-
-            for (int ii = 0; ii < values.Count; ii++)
-            {
-                count++;
-            }
+            // count the Annotations.
+            int count = CountAnnotations(slice);
 
             // set the timestamp and status.
             var value = new DataValue
@@ -193,8 +189,8 @@ namespace Opc.Ua.Server
             // check for empty slice.
             if (values == null || values.Count == 0)
             {
-                // handle empty slices by returning no data or marking the whole slice as BadNoData for status calculaton.
-                // if the slice overlaps the start of the data.
+                // an empty slice is Bad_NoData, unless it overlaps the start of data: then the whole
+                // slice counts as Bad_NoData for the status calculation.
                 if (!ContainsDataStart(slice))
                 {
                     return GetNoDataValue(slice);
@@ -207,60 +203,12 @@ namespace Opc.Ua.Server
                 };
             }
 
-            // Boolean + Stepped=False: CTT does not interpolate Boolean
-            // Stepped=False -> replace invalid Boolean bounds with BadNoData and track whether the end bound is missing.
-            bool isEndBoundMissing = false;
-
-            if (values.Count > 1 && !Stepped && RawDataType?.BuiltInType == BuiltInType.Boolean)
-            {
-                if (IsBooleanBoundMissing(values[0], slice, slice.StartTime))
-                {
-                    values[0] = CreateNoDataValue(slice.StartTime);
-                }
-
-                if (IsBooleanBoundMissing(values[values.Count - 1], slice, slice.EndTime))
-                {
-                    values[values.Count - 1] = CreateNoDataValue(slice.EndTime);
-                    isEndBoundMissing = true;
-                }
-            }
-
             // get the regions.
             List<SubRegion> regions = GetRegionsInValueSet(values, false, true);
 
             double duration = 0;
 
-            // Without an end bound, GetRegionsInValueSet truncates the last Good region to 1 tick.
-            // The remaining time up to EndTime is UncertainDataSubNormal (included in status calculation, but not in duration).
-            SubRegion goodRegionForStatusAdjustment = null;
-
-            if (isEndBoundMissing && regions != null && regions.Count > 0)
-            {
-                SubRegion lastRegion = regions[regions.Count - 1];
-
-                // the duration from the start of the region up to EndTime
-                double remainingDurationMs = (slice.EndTime - lastRegion.StartTime).TotalMilliseconds;
-
-                if (lastRegion.Duration == 1 && StatusCode.IsGood(lastRegion.StatusCode))
-                {
-                    goodRegionForStatusAdjustment = lastRegion;   // Good for duration, Uncertain for status
-                }
-
-                if (lastRegion.Duration == 1 && remainingDurationMs > 1)
-                {
-                    regions.Add(new SubRegion
-                    {
-                        StartTime = lastRegion.StartTime.AddMilliseconds(1),
-                        Duration = remainingDurationMs - 1,
-                        StartValue = lastRegion.StartValue,
-                        EndValue = lastRegion.StartValue,
-                        StatusCode = StatusCodes.UncertainDataSubNormal
-                    });
-                }
-            }
-
-
-            // the tick is still Good -> it counts in duration
+            // only Good regions count for the duration.
             for (int ii = 0; ii < regions.Count; ii++)
             {
                 if (StatusCode.IsNotGood(regions[ii].StatusCode))
@@ -274,11 +222,21 @@ namespace Opc.Ua.Server
                 }
             }
 
-            // 5.4.3.2.2: SlopedInterpolation (Stepped=False):
-            // - Good region ending at a Bad/Uncertain value is treated as Uncertain (for status calculation only).
-            // - Its duration has already been calculated, doesn't change.
+            // Part 13 §5.4.3.2.2: with SlopedInterpolation (Stepped = False) a region that ends in a Bad
+            // or Uncertain value is Uncertain. This affects the status only; the duration is counted
+            // above. GetTimeBasedStatusCode then applies TreatUncertainAsBad (§5.4.3.2.1).
             if (!Stepped)
             {
+                // index the values by timestamp once instead of searching the whole list for every region.
+                var byTimestamp = new List<(long Ticks, int Index)>(values.Count);
+
+                for (int ii = 0; ii < values.Count; ii++)
+                {
+                    byTimestamp.Add((values[ii].SourceTimestamp.Ticks, ii));
+                }
+
+                byTimestamp.Sort();
+
                 foreach (SubRegion region in regions)
                 {
                     if (!StatusCode.IsGood(region.StatusCode))
@@ -288,7 +246,7 @@ namespace Opc.Ua.Server
 
                     DateTime regionEnd = region.StartTime.AddMilliseconds(region.Duration);
 
-                    DataValue endPoint = values.Find(v => Math.Abs((v.SourceTimestamp - regionEnd).TotalMilliseconds) < 0.5);
+                    DataValue endPoint = FindValueAt(values, byTimestamp, regionEnd);
 
                     if (endPoint != null && StatusCode.IsNotGood(endPoint.StatusCode))
                     {
@@ -297,53 +255,18 @@ namespace Opc.Ua.Server
                 }
             }
 
-            // set final Good tick as Uncertain for status calculation
-            if (goodRegionForStatusAdjustment != null)
-            {
-                goodRegionForStatusAdjustment.StatusCode = StatusCodes.UncertainDataSubNormal;
-            }
-
-            // set TreatUncertainAsBad AFTER final tick mark
-            // all Uncertain regions (including that tick) --> counted as Bad (for status calculation)
-            if (Configuration.TreatUncertainAsBad)
-            {
-                foreach (SubRegion region in regions)
-                {
-                    if (StatusCode.IsUncertain(region.StatusCode))
-                    {
-                        region.StatusCode = StatusCodes.BadNoData;
-                    }
-                }
-            }
+            // the duration is rounded to whole milliseconds, half to even (Mantis 11499: Part 13 will
+            // say that Duration values are rounded, without fixing the algorithm).
+            duration = Math.Round(duration, MidpointRounding.ToEven);
 
             // set the timestamp and status.
             var value = new DataValue
             {
+                WrappedValue = new Variant(duration, TypeInfo.Scalars.Double),
                 SourceTimestamp = GetTimestamp(slice),
                 ServerTimestamp = GetTimestamp(slice)
             };
-
-            StatusCode status = GetTimeBasedStatusCode(regions, value.StatusCode);
-
-            // when PercentDataGood + PercentDataBad == 100 --> use UncertainDataSubNormal (not Bad) if the interval falls below PercentDataGood.
-            // leave BadNoData unchanged
-            if (status.CodeBits == StatusCodes.Bad && Configuration.PercentDataGood + Configuration.PercentDataBad == 100)
-            {
-                status = value.StatusCode.SetCodeBits(StatusCodes.UncertainDataSubNormal);
-            }
-
-            // Bad interval --> Null value and status Bad + Calculated
-            if (StatusCode.IsBad(status))
-            {
-                value.WrappedValue = Variant.Null;
-                value.StatusCode = StatusCodes.Bad;
-            }
-            else
-            {
-                value.WrappedValue = new Variant(duration, TypeInfo.Scalars.Double);
-                value.StatusCode = status;
-            }
-
+            value.StatusCode = GetTimeBasedStatusCode(regions, value.StatusCode);
             value.StatusCode = value.StatusCode.SetAggregateBits(AggregateBits.Calculated);
 
             // return result.
@@ -351,40 +274,46 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// Determines whether an interpolated Boolean bound should be treated as missing when Stepped=False:
-        /// - non-interpolated bounds -> kept
-        /// - Good interpolated bounds -> missing
-        /// - other interpolated bounds -> missing only if the next raw point exists and is not Bad.
+        /// Returns the first value (in list order) whose source timestamp is less than 0.5 ms from the timestamp,
+        /// or NULL. byTimestamp holds the (ticks, index) of the values, sorted by ticks and then by index.
         /// </summary>
-        private static bool IsBooleanBoundMissing(DataValue bound, TimeSlice slice, DateTime timestamp)
+        private static DataValue FindValueAt(
+            List<DataValue> values,
+            List<(long Ticks, int Index)> byTimestamp,
+            DateTime timestamp)
         {
-            if ((bound.StatusCode.AggregateBits & AggregateBits.Interpolated) == 0)
+            const long kToleranceTicks = TimeSpan.TicksPerMillisecond / 2;
+            long ticks = timestamp.Ticks;
+
+            // first entry that is later than (timestamp - 0.5 ms).
+            int lo = 0;
+            int hi = byTimestamp.Count;
+
+            while (lo < hi)
             {
-                return false;
+                int mid = lo + ((hi - lo) / 2);
+
+                if (byTimestamp[mid].Ticks - ticks > -kToleranceTicks)
+                {
+                    hi = mid;
+                }
+                else
+                {
+                    lo = mid + 1;
+                }
             }
 
-            if (StatusCode.IsGood(bound.StatusCode))
+            int found = -1;
+
+            for (int ii = lo; ii < byTimestamp.Count && byTimestamp[ii].Ticks - ticks < kToleranceTicks; ii++)
             {
-                return true;
+                if (found < 0 || byTimestamp[ii].Index < found)
+                {
+                    found = byTimestamp[ii].Index;
+                }
             }
 
-            DataValue after = FindFirstRawAfter(slice, timestamp);
-            return after != null && !StatusCode.IsBad(after.StatusCode);
-        }
-
-        /// <summary>
-        /// Returns the FIRST raw data point strictly after the specified timestamp or NULL if no such point is found.
-        /// </summary>
-        private static DataValue FindFirstRawAfter(TimeSlice slice, DateTime timestamp)
-        {
-            LinkedListNode<DataValue> node = slice.EarlyBound ?? slice.Begin;
-
-            while (node != null && node.Value.SourceTimestamp <= timestamp)
-            {
-                node = node.Next;
-            }
-
-            return node?.Value;
+            return found >= 0 ? values[found] : null;
         }
 
         /// <summary>
@@ -414,8 +343,13 @@ namespace Opc.Ua.Server
                 return GetNoDataValue(slice);
             }
 
-            // The first non-bad value is a transition when no previous non-bad value exists.
-            LinkedListNode<DataValue> previousValue = slice.NonBadEarlyBound;
+            // Part 13 §5.4.3.24 uses the non-Bad values. The definition says nothing about Uncertain
+            // values in the interval, so §4.2.1.2 applies: with TreatUncertainAsBad = True an
+            // Uncertain value is Bad and is not counted (IsGood). The previous value is the bound
+            // (Table 72: a non-Bad value prior to the interval), and TreatUncertainAsBad does not
+            // apply to bounds (Mantis 11462), so it is the early bound, also when it is Uncertain.
+            // The first usable value is a transition when no previous value exists.
+            LinkedListNode<DataValue> previousValue = slice.EarlyBound;
             bool hasLastValue = previousValue != null;
             object lastValue = previousValue?.Value.Value;
 
@@ -424,7 +358,7 @@ namespace Opc.Ua.Server
 
             for (int ii = 0; ii < values.Count; ii++)
             {
-                if (StatusCode.IsBad(values[ii].StatusCode))
+                if (!IsGood(values[ii]))
                 {
                     continue;
                 }

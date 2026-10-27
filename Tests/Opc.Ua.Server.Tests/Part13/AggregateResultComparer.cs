@@ -33,6 +33,23 @@ namespace Opc.Ua.Server.Tests.Part13
             bool stepped,
             AggregateConfiguration configuration)
         {
+            return Run(aggregateId, rawChronological, startTime, endTime, processingInterval, stepped, configuration, null);
+        }
+
+        /// <summary>
+        /// Runs the standard calculator for the request with the timestamps of the variable's
+        /// Annotations (AnnotationCount, Part 13 §5.4.3.20).
+        /// </summary>
+        public static List<DataValue> Run(
+            NodeId aggregateId,
+            IList<DataValue> rawChronological,
+            DateTime startTime,
+            DateTime endTime,
+            double processingInterval,
+            bool stepped,
+            AggregateConfiguration configuration,
+            IEnumerable<DateTime> annotations)
+        {
             IAggregateCalculator calculator = Aggregators.CreateStandardCalculator(
                 aggregateId,
                 startTime,
@@ -45,6 +62,14 @@ namespace Opc.Ua.Server.Tests.Part13
             if (calculator == null)
             {
                 throw new NotSupportedException("No standard calculator for " + aggregateId);
+            }
+
+            if (annotations != null)
+            {
+                foreach (DateTime annotation in annotations)
+                {
+                    ((AggregateCalculator)calculator).QueueAnnotation(annotation);
+                }
             }
 
             IEnumerable<DataValue> ordered = endTime < startTime

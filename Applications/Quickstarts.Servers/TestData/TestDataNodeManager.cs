@@ -724,6 +724,17 @@ namespace TestData
                     continue;
                 }
 
+                // Part 13 Table 50: the aggregate must support the data type of the variable.
+                if (!AggregateManager.IsSupportedForDataType(
+                    details.AggregateType[handle.Index],
+                    variable.DataType,
+                    variable.ValueRank,
+                    context.TypeTable))
+                {
+                    errors[handle.Index] = StatusCodes.BadAggregateNotSupported;
+                    continue;
+                }
+
                 errors[handle.Index] = ProcessedHistoryAdapter.Read(
                     context,
                     Server,

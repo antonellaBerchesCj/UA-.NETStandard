@@ -172,6 +172,89 @@ namespace Opc.Ua.Server.Tests
         }
 
         [Test]
+        public void SlopedInterpolateWithNullBoundReturnsBadTypeMismatch()
+        {
+            var timestamp = new DateTime(2024, 1, 1, 0, 0, 5);
+            DataValue bound = Good(10.0, new DateTime(2024, 1, 1, 0, 0, 10));
+
+            Assert.That(AggregateCalculator.SlopedInterpolate(timestamp, null, bound).StatusCode.CodeBits, Is.EqualTo(StatusCodes.BadTypeMismatch));
+            Assert.That(AggregateCalculator.SlopedInterpolate(timestamp, bound, null).StatusCode.CodeBits, Is.EqualTo(StatusCodes.BadTypeMismatch));
+        }
+
+        [Test]
+        public void SlopedInterpolateConvertsIntegersWithTypeInfoCast()
+        {
+            var early = new DateTime(2024, 1, 1, 0, 0, 0);
+            var late = new DateTime(2024, 1, 1, 0, 0, 10);
+            var earlyBound = new DataValue(new Variant(2), StatusCodes.Good, early, early);
+            var lateBound = new DataValue(new Variant(3), StatusCodes.Good, late, late);
+
+            // 2.5 is converted like TypeInfo.Cast (Convert.ToInt32): to the even neighbour.
+            DataValue result = AggregateCalculator.SlopedInterpolate(new DateTime(2024, 1, 1, 0, 0, 5), earlyBound, lateBound);
+
+            Assert.That(result.Value, Is.EqualTo(2));
+            Assert.That(result.WrappedValue.TypeInfo.BuiltInType, Is.EqualTo(BuiltInType.Int32));
+        }
+
+        /// <summary>
+        /// A Good sample without a value cannot be converted to a number. The region it starts is
+        /// Bad_TypeMismatch and left out, so the result is Uncertain over the remaining 20 s, as in
+        /// 1.5.378. The first version of the Part 13 change used 0 for the failed conversion and kept
+        /// the Good status (11.67 Good for TimeAverage). Data: 10 at 0 s, a Good sample without a
+        /// value at 10 s, 20 at 20 s and 30 s; interval [0, 30 s).
+        /// </summary>
+        [TestCase("TimeAverage", 12.5)]
+        [TestCase("TimeAverage2", 12.5)]
+        [TestCase("Total", 250.0)]
+        [TestCase("Total2", 250.0)]
+        public void GoodSampleWithoutAValueIsNotCalculatedAsZero(string aggregateName, double expected)
+        {
+            var start = new DateTime(2024, 1, 1, 0, 0, 0);
+            DataValue[] values =
+            [
+                Good(10.0, start),
+                new DataValue(Variant.Null, StatusCodes.Good, start.AddSeconds(10), start.AddSeconds(10)),
+                Good(20.0, start.AddSeconds(20)),
+                Good(20.0, start.AddSeconds(30))
+            ];
+
+            DataValue result = ComputeSingleInterval(aggregateName, values, start, start.AddSeconds(30), false);
+
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(expected).Within(1e-9));
+            Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.UncertainDataSubNormal));
+        }
+
+        /// <summary>
+        /// All-Good data in one interval (ProcessingInterval 0) that starts 1 s before the first raw
+        /// value stays Good in both directions, as in 1.5.378. The first version of the Part 13
+        /// change lowered PercentGood of a forward single interval by the part before the first
+        /// value, which made these results Uncertain_DataSubNormal. Data: 1, 2, 3, 4 at 1, 11, 21 and
+        /// 31 s; interval [0, 41 s).
+        /// </summary>
+        [TestCase("Average", 2.5, false)]
+        [TestCase("Average", 2.5, true)]
+        [TestCase("Count", 4.0, false)]
+        [TestCase("Count", 4.0, true)]
+        [TestCase("NumberOfTransitions", 4.0, false)]
+        [TestCase("NumberOfTransitions", 4.0, true)]
+        public void AllGoodDataStaysGoodWhenTheIntervalStartsBeforeTheFirstValue(string aggregateName, double expected, bool reverse)
+        {
+            var start = new DateTime(2024, 1, 1, 0, 0, 0);
+            DataValue[] values =
+            [
+                Good(1.0, start.AddSeconds(1)),
+                Good(2.0, start.AddSeconds(11)),
+                Good(3.0, start.AddSeconds(21)),
+                Good(4.0, start.AddSeconds(31))
+            ];
+
+            DataValue result = ComputeSingleInterval(aggregateName, values, start, start.AddSeconds(41), reverse);
+
+            Assert.That(result.WrappedValue.ConvertToDouble().GetDouble(), Is.EqualTo(expected).Within(1e-9));
+            Assert.That(result.StatusCode.CodeBits, Is.EqualTo(StatusCodes.Good));
+        }
+
+        [Test]
         public void HasEndTimePassedReflectsProcessingWindow()
         {
             var startTime = new DateTime(2024, 1, 1, 0, 0, 0);
@@ -309,6 +392,44 @@ namespace Opc.Ua.Server.Tests
             }
 
             Assert.That(any, Is.True);
+        }
+
+        /// <summary>
+        /// Runs one interval (ProcessingInterval 0) from the early to the late time, or backward,
+        /// with TreatUncertainAsBad = False, and returns its result.
+        /// </summary>
+        private DataValue ComputeSingleInterval(
+            string aggregateName,
+            DataValue[] chronological,
+            DateTime earlyTime,
+            DateTime lateTime,
+            bool reverse)
+        {
+            var configuration = new AggregateConfiguration
+            {
+                TreatUncertainAsBad = false,
+                PercentDataBad = 100,
+                PercentDataGood = 100,
+                UseSlopedExtrapolation = false
+            };
+            IAggregateCalculator calculator = Aggregators.CreateStandardCalculator(
+                Aggregators.GetIdForStandardAggregate(new QualifiedName(aggregateName)),
+                reverse ? lateTime : earlyTime,
+                reverse ? earlyTime : lateTime,
+                0,
+                false,
+                configuration,
+                m_telemetry);
+
+            for (int index = 0; index < chronological.Length; index++)
+            {
+                DataValue value = chronological[reverse ? chronological.Length - 1 - index : index];
+                Assert.That(calculator.QueueRawValue(value), Is.True);
+            }
+
+            Assert.That(calculator.TryGetProcessedValue(true, out DataValue result), Is.True);
+            Assert.That(calculator.TryGetProcessedValue(true, out _), Is.False);
+            return result;
         }
 
         private DataValue ComputeInterpolativeBoundary(

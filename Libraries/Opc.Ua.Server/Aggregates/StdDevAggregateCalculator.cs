@@ -248,7 +248,9 @@ namespace Opc.Ua.Server
 
             for (int ii = 0; ii < values.Count; ii++)
             {
-                if (IsGood(values[ii]))
+                // Part 13 §5.4.3.37-40: only Good raw values, whatever TreatUncertainAsBad is
+                // (Mantis 3301, 11495).
+                if (StatusCode.IsGood(values[ii].StatusCode))
                 {
                     try
                     {

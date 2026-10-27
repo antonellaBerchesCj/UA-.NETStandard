@@ -28,6 +28,7 @@
  * ======================================================================*/
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace Opc.Ua.Server
@@ -43,7 +44,7 @@ namespace Opc.Ua.Server
         public AggregateManager(IServerInternal server)
         {
             m_server = server;
-            m_factories = new NodeIdDictionary<AggregatorFactory>();
+            m_factories = [];
             m_minimumProcessingInterval = 1000;
         }
 
@@ -115,18 +116,15 @@ namespace Opc.Ua.Server
         {
             lock (m_lock)
             {
-                if (m_defaultConfiguration == null)
+                m_defaultConfiguration ??= new AggregateConfiguration
                 {
-                    m_defaultConfiguration = new AggregateConfiguration
-                    {
-                        PercentDataBad = 100,
-                        PercentDataGood = 100,
-                        // OPC UA Part 13 specifies that uncertain values are treated as bad by default.
-                        TreatUncertainAsBad = true,
-                        UseSlopedExtrapolation = false,
-                        UseServerCapabilitiesDefaults = false
-                    };
-                }
+                    PercentDataBad = 100,
+                    PercentDataGood = 100,
+                    // OPC UA Part 13 specifies that uncertain values are treated as bad by default.
+                    TreatUncertainAsBad = true,
+                    UseSlopedExtrapolation = false,
+                    UseServerCapabilitiesDefaults = false
+                };
 
                 return m_defaultConfiguration;
             }
@@ -221,6 +219,110 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
+        /// True if the aggregate can be calculated for a variable with the data type and value rank
+        /// (Part 13 §5.4.2.3, Table 50). The numeric aggregates need a numeric scalar ("Dates,
+        /// strings, arrays, etc. are not supported"); DurationInStateZero, DurationInStateNonZero
+        /// and NumberOfTransitions also accept Boolean and enumerations; the other standard
+        /// aggregates accept all data types. An abstract data type (BaseDataType) or a value rank
+        /// that allows scalars cannot decide this, so it is accepted and the calculator checks each
+        /// value. Aggregates other than the standard aggregates are always accepted.
+        /// </summary>
+        /// <param name="aggregateId">The aggregate function.</param>
+        /// <param name="dataTypeId">The DataType of the variable.</param>
+        /// <param name="valueRank">The ValueRank of the variable.</param>
+        /// <param name="typeTree">The type tree used to find the built-in type of a subtype.</param>
+        /// <returns>False if Table 50 does not allow the aggregate for the data type.</returns>
+        public static bool IsSupportedForDataType(
+            NodeId aggregateId,
+            NodeId dataTypeId,
+            int valueRank,
+            ITypeTable typeTree)
+        {
+            AggregateDataTypes validTypes = GetValidDataTypes(aggregateId);
+
+            if (validTypes == AggregateDataTypes.All)
+            {
+                return true;
+            }
+
+            // arrays are not supported (§5.4.2.3).
+            if (valueRank >= ValueRanks.OneOrMoreDimensions)
+            {
+                return false;
+            }
+
+            if (NodeId.IsNull(dataTypeId))
+            {
+                return true;
+            }
+
+            BuiltInType builtInType = typeTree != null
+                ? TypeInfo.GetBuiltInType(dataTypeId, typeTree)
+                : TypeInfo.GetBuiltInType(dataTypeId);
+
+            // BaseDataType or an unknown type: the values decide.
+            if (builtInType is BuiltInType.Variant or BuiltInType.Null)
+            {
+                return true;
+            }
+
+            return IsValidBuiltInType(builtInType, validTypes);
+        }
+
+        /// <summary>
+        /// The source data types an aggregate accepts (Part 13 Table 50).
+        /// </summary>
+        internal enum AggregateDataTypes
+        {
+            /// <summary>All data types.</summary>
+            All,
+
+            /// <summary>Numeric, Boolean and enumerations.</summary>
+            NumericOrDigital,
+
+            /// <summary>Numeric only.</summary>
+            Numeric
+        }
+
+        /// <summary>
+        /// Returns the source data types an aggregate accepts (Part 13 Table 50).
+        /// </summary>
+        internal static AggregateDataTypes GetValidDataTypes(NodeId aggregateId)
+        {
+            if (aggregateId == null)
+            {
+                return AggregateDataTypes.All;
+            }
+
+            if (s_numericAggregates.Contains(aggregateId))
+            {
+                return AggregateDataTypes.Numeric;
+            }
+
+            if (s_numericOrDigitalAggregates.Contains(aggregateId))
+            {
+                return AggregateDataTypes.NumericOrDigital;
+            }
+
+            return AggregateDataTypes.All;
+        }
+
+        /// <summary>
+        /// True if a value of the built-in type can be used by an aggregate that accepts the
+        /// data types. Boolean and enumerations are digital data types (§5.4.2.3).
+        /// </summary>
+        internal static bool IsValidBuiltInType(BuiltInType builtInType, AggregateDataTypes validTypes)
+        {
+            if (validTypes == AggregateDataTypes.All || TypeInfo.IsNumericType(builtInType))
+            {
+                return true;
+            }
+
+            return validTypes == AggregateDataTypes.NumericOrDigital &&
+                builtInType is BuiltInType.Boolean or BuiltInType.Enumeration;
+        }
+
+        /// <summary>
         /// Creates a new aggregate calculator.
         /// </summary>
         /// <param name="aggregateId">The id of the aggregate function.</param>
@@ -302,7 +404,46 @@ namespace Opc.Ua.Server
             }
         }
 
-        private readonly object m_lock = new object();
+        /// <summary>
+        /// The aggregates of Part 13 Table 50 with the valid data type "Numeric".
+        /// </summary>
+        private static readonly HashSet<NodeId> s_numericAggregates =
+        [
+            ObjectIds.AggregateFunction_Interpolative,
+            ObjectIds.AggregateFunction_Average,
+            ObjectIds.AggregateFunction_TimeAverage,
+            ObjectIds.AggregateFunction_TimeAverage2,
+            ObjectIds.AggregateFunction_Total,
+            ObjectIds.AggregateFunction_Total2,
+            ObjectIds.AggregateFunction_Minimum,
+            ObjectIds.AggregateFunction_Maximum,
+            ObjectIds.AggregateFunction_MinimumActualTime,
+            ObjectIds.AggregateFunction_MaximumActualTime,
+            ObjectIds.AggregateFunction_Range,
+            ObjectIds.AggregateFunction_Minimum2,
+            ObjectIds.AggregateFunction_Maximum2,
+            ObjectIds.AggregateFunction_MinimumActualTime2,
+            ObjectIds.AggregateFunction_MaximumActualTime2,
+            ObjectIds.AggregateFunction_Range2,
+            ObjectIds.AggregateFunction_Delta,
+            ObjectIds.AggregateFunction_DeltaBounds,
+            ObjectIds.AggregateFunction_StandardDeviationSample,
+            ObjectIds.AggregateFunction_VarianceSample,
+            ObjectIds.AggregateFunction_StandardDeviationPopulation,
+            ObjectIds.AggregateFunction_VariancePopulation
+        ];
+
+        /// <summary>
+        /// The aggregates of Part 13 Table 50 with the valid data type "Numeric or Boolean".
+        /// </summary>
+        private static readonly HashSet<NodeId> s_numericOrDigitalAggregates =
+        [
+            ObjectIds.AggregateFunction_DurationInStateZero,
+            ObjectIds.AggregateFunction_DurationInStateNonZero,
+            ObjectIds.AggregateFunction_NumberOfTransitions
+        ];
+
+        private readonly Lock m_lock = new();
         private readonly IServerInternal m_server;
         private AggregateConfiguration m_defaultConfiguration;
         private readonly NodeIdDictionary<AggregatorFactory> m_factories;

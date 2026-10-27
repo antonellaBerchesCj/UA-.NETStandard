@@ -66,14 +66,14 @@ namespace Opc.Ua.Server
         }
 
         /// <summary>
-        /// TimeAverage always uses a sloped line between points and Interpolated Bounding Values
-        /// (Part 13 §5.4.3.6: "Note that this calculation always uses a SlopedInterpolation between
-        /// points"), also for a Stepped variable. Total, TimeAverage2 and Total2 follow the Stepped
-        /// attribute, as Annex A (Historian3) and the CTT 1.05.513 Aggregate tests calculate Total.
+        /// TimeAverage and Total always use a sloped line between points and Interpolated Bounding
+        /// Values, also for a Stepped variable (Part 13 §5.4.3.6, §5.4.3.8: Total is TimeAverage x
+        /// ProcessingInterval). TimeAverage2 and Total2 follow the Stepped attribute.
         /// </summary>
         private static bool AlwaysSloped(NodeId aggregateId)
         {
-            return aggregateId == ObjectIds.AggregateFunction_TimeAverage;
+            return aggregateId == ObjectIds.AggregateFunction_TimeAverage ||
+                aggregateId == ObjectIds.AggregateFunction_Total;
         }
 
         /// <summary>
@@ -124,9 +124,7 @@ namespace Opc.Ua.Server
 
             for (int ii = 0; ii < values.Count; ii++)
             {
-                // Part 13 §4.2.1.2: with TreatUncertainAsBad = false an Uncertain value is
-                // equivalent to Good, so it is included in the average (IsGood applies the setting).
-                if (IsGood(values[ii]))
+                if (StatusCode.IsGood(values[ii].StatusCode))
                 {
                     try
                     {
@@ -186,24 +184,31 @@ namespace Opc.Ua.Server
                 return GetNoDataValue(slice);
             }
 
-            // get the regions.
+            // get the regions. TimeAverage2 and Total2 leave all non-Good data out of the value, also
+            // Uncertain data with TreatUncertainAsBad = False (Part 13 §5.4.3.7; Tables 55, 57: an
+            // Uncertain bound is treated like any other Uncertain or non-Good value). The StatusCode
+            // still follows §5.4.3.2.1 with the configured TreatUncertainAsBad, so it is calculated
+            // from the regions of the configured rules.
             List<SubRegion> regions = GetRegionsInValueSet(values, !useSimpleBounds, Stepped);
+            List<SubRegion> valueRegions = useSimpleBounds
+                ? GetRegionsInValueSet(values, false, Stepped, true)
+                : regions;
 
             double total = 0;
             double totalDuration = 0;
             bool nonGoodRegionsExists = false;
 
-            for (int ii = 0; ii < regions.Count; ii++)
+            for (int ii = 0; ii < valueRegions.Count; ii++)
             {
-                double duration = regions[ii].Duration / 1000.0;
+                double duration = valueRegions[ii].Duration / 1000.0;
 
-                if (StatusCode.IsNotBad(regions[ii].StatusCode))
+                if (StatusCode.IsNotBad(valueRegions[ii].StatusCode))
                 {
-                    total += (regions[ii].StartValue + regions[ii].EndValue) * duration / 2;
+                    total += (valueRegions[ii].StartValue + valueRegions[ii].EndValue) * duration / 2;
                     totalDuration += duration;
                 }
 
-                if (StatusCode.IsNotGood(regions[ii].StatusCode))
+                if (StatusCode.IsNotGood(valueRegions[ii].StatusCode))
                 {
                     nonGoodRegionsExists = true;
                 }
@@ -215,21 +220,20 @@ namespace Opc.Ua.Server
                 // Part 13 §5.4.3.7, §5.4.3.9: with Simple Bounding Values the non-Good data is
                 // omitted; when the interval holds only such data the result is not Bad_NoData
                 // (there is data in the interval, §5.4.3.2.1) but the PercentTime status, i.e. Bad.
-                // Since TreatUncertainAsBad no longer applies to bounds (Mantis 11462), an
-                // Uncertain start bound is omitted here like any other Uncertain region.
-                // Only non-Bad data that was omitted (an Uncertain value or bound with
-                // TreatUncertainAsBad = true) gives Bad; an interval that holds only Bad raw values
-                // or Bad_NoData bounds has no usable data and stays Bad_NoData (Annex A Historian1
-                // [12:00:40, 12:00:45), CTT Aggregate 005-03).
-                if (useSimpleBounds && regions.Exists(region =>
+                // Only non-Bad data that was omitted (an Uncertain value or bound; Tables 55, 57:
+                // "Bound Uncertain: Treated as any other Uncertain value in the interval") gives Bad;
+                // an interval that holds only Bad raw values or Bad_NoData bounds has no usable data
+                // and stays Bad_NoData (Annex A Historian1 [12:00:40, 12:00:45)).
+                // Without Good data no value can be calculated, so the result is Bad whatever the
+                // PercentTime status of the regions would be.
+                if (useSimpleBounds && valueRegions.Exists(region =>
                     region.Duration > 0 &&
                     region.DataPoint != null &&
                     StatusCode.IsNotBad(region.DataPoint.StatusCode)))
                 {
-                    StatusCode status = GetTimeBasedStatusCode(regions, StatusCodes.Good);
                     return new DataValue(
                         Variant.Null,
-                        status.SetAggregateBits(AggregateBits.Calculated),
+                        new StatusCode(StatusCodes.Bad).SetAggregateBits(AggregateBits.Calculated),
                         GetTimestamp(slice),
                         GetTimestamp(slice));
                 }

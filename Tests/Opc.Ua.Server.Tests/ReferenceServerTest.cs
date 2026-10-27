@@ -2001,6 +2001,138 @@ namespace Opc.Ua.Server.Tests
             }
         }
 
+        /// <summary>
+        /// Part 13 Table 50: a numeric aggregate is not supported for a String or Boolean variable
+        /// (Bad_AggregateNotSupported, Table 45); aggregates valid for those data types are read.
+        /// </summary>
+        [TestCase("Scalar_Static_String", "Average", false)]
+        [TestCase("Scalar_Static_String", "Count", true)]
+        [TestCase("Scalar_Static_Boolean", "TimeAverage", false)]
+        [TestCase("Scalar_Static_Boolean", "DurationInStateZero", true)]
+        [TestCase("Scalar_Static_Int32", "Average", true)]
+        public async Task ReferenceProcessedHistoryChecksTheAggregateDataTypeAsync(
+            string nodeName,
+            string aggregateName,
+            bool supported)
+        {
+            ushort namespaceIndex = (ushort)m_server.CurrentInstance.NamespaceUris.GetIndex(
+                Quickstarts.ReferenceServer.Namespaces.ReferenceServer);
+            var nodeId = new NodeId(nodeName, namespaceIndex);
+            DateTime end = DateTime.UtcNow;
+            var details = new ReadProcessedDetails
+            {
+                StartTime = end.AddSeconds(-600),
+                EndTime = end,
+                ProcessingInterval = 60000,
+                AggregateType = [Aggregators.GetIdForStandardAggregate(new QualifiedName(aggregateName))],
+                AggregateConfiguration = new AggregateConfiguration
+                {
+                    UseServerCapabilitiesDefaults = true
+                }
+            };
+            var nodes = new HistoryReadValueIdCollection
+            {
+                new HistoryReadValueId { NodeId = nodeId }
+            };
+
+            HistoryReadResponse response = await m_server.HistoryReadAsync(
+                m_secureChannelContext,
+                m_requestHeader,
+                new ExtensionObject(details),
+                TimestampsToReturn.Both,
+                false,
+                nodes,
+                CancellationToken.None).ConfigureAwait(false);
+
+            if (supported)
+            {
+                Assert.IsTrue(StatusCode.IsGood(response.Results[0].StatusCode), response.Results[0].StatusCode.ToString());
+            }
+            else
+            {
+                Assert.AreEqual((uint)StatusCodes.BadAggregateNotSupported, response.Results[0].StatusCode.Code);
+            }
+        }
+
+        /// <summary>
+        /// Part 13 Table 50: a MonitoredItem with an AggregateFilter is refused with
+        /// Bad_AggregateNotSupported when the aggregate does not support the variable's data type.
+        /// AnnotationCount is refused for every variable: it counts Annotations, which never reach a
+        /// MonitoredItem (§5.4.3.20).
+        /// </summary>
+        [TestCase("Scalar_Static_String", "Average", false)]
+        [TestCase("Scalar_Static_String", "Count", true)]
+        [TestCase("Scalar_Static_Boolean", "Minimum", false)]
+        [TestCase("Scalar_Static_Boolean", "NumberOfTransitions", true)]
+        [TestCase("Scalar_Static_Double", "Average", true)]
+        [TestCase("Scalar_Static_Double", "AnnotationCount", false)]
+        [TestCase("Scalar_Static_Int32", "AnnotationCount", false)]
+        public async Task ReferenceAggregateFilterChecksTheAggregateAsync(
+            string nodeName,
+            string aggregateName,
+            bool supported)
+        {
+            ushort namespaceIndex = (ushort)m_server.CurrentInstance.NamespaceUris.GetIndex(
+                Quickstarts.ReferenceServer.Namespaces.ReferenceServer);
+            CreateSubscriptionResponse subscription = await m_server.CreateSubscriptionAsync(
+                m_secureChannelContext,
+                m_requestHeader,
+                1000,
+                100,
+                10,
+                0,
+                true,
+                0,
+                CancellationToken.None).ConfigureAwait(false);
+            var filter = new AggregateFilter
+            {
+                StartTime = DateTime.UtcNow,
+                AggregateType = Aggregators.GetIdForStandardAggregate(new QualifiedName(aggregateName)),
+                ProcessingInterval = 1000,
+                AggregateConfiguration = new AggregateConfiguration
+                {
+                    UseServerCapabilitiesDefaults = true
+                }
+            };
+            var itemsToCreate = new MonitoredItemCreateRequestCollection
+            {
+                new MonitoredItemCreateRequest
+                {
+                    ItemToMonitor = new ReadValueId
+                    {
+                        AttributeId = Attributes.Value,
+                        NodeId = new NodeId(nodeName, namespaceIndex)
+                    },
+                    MonitoringMode = MonitoringMode.Reporting,
+                    RequestedParameters = new MonitoringParameters
+                    {
+                        ClientHandle = 1,
+                        SamplingInterval = 100,
+                        Filter = new ExtensionObject(filter),
+                        DiscardOldest = true,
+                        QueueSize = 10
+                    }
+                }
+            };
+
+            CreateMonitoredItemsResponse response = await m_server.CreateMonitoredItemsAsync(
+                m_secureChannelContext,
+                m_requestHeader,
+                subscription.SubscriptionId,
+                TimestampsToReturn.Both,
+                itemsToCreate,
+                CancellationToken.None).ConfigureAwait(false);
+
+            if (supported)
+            {
+                Assert.IsTrue(StatusCode.IsGood(response.Results[0].StatusCode), response.Results[0].StatusCode.ToString());
+            }
+            else
+            {
+                Assert.AreEqual((uint)StatusCodes.BadAggregateNotSupported, response.Results[0].StatusCode.Code);
+            }
+        }
+
         [Test]
         public async Task ReferenceStaticInt32AnnotationCountUsesSidecarAsync()
         {
@@ -2037,8 +2169,11 @@ namespace Opc.Ua.Server.Tests
             var data = (HistoryData)response.Results[0].HistoryData.Body;
             Assert.AreEqual(1, data.DataValues.Count);
             Assert.AreEqual(4, data.DataValues[0].Value);
+
+            // the single interval holds the edge of the seeded history, so it is not a complete
+            // interval (Part 13 Table 68: Partial "Set Sometimes"; §5.3.3.2).
             Assert.AreEqual(
-                AggregateBits.Calculated,
+                AggregateBits.Calculated | AggregateBits.Partial,
                 data.DataValues[0].StatusCode.AggregateBits);
         }
 

@@ -28,6 +28,9 @@
     <!-- OPC 10000-13 v1.05.07 Annex A examples (UA-Nodeset Schema/AggregateExamples.csv) -->
     <None Remove="Part13\AggregateExamples.csv" />
     <EmbeddedResource Include="Part13\AggregateExamples.csv" LogicalName="Part13.AggregateExamples.csv" />
+    <!-- AggregateBehaviourMatrix results of the 1.5.378 release branch (Part13/README.md) -->
+    <None Remove="Part13\Master378AggregateResults.txt.gz" />
+    <EmbeddedResource Include="Part13\Master378AggregateResults.txt.gz" LogicalName="Part13.Master378AggregateResults.txt.gz" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\Common\Main.cs" />

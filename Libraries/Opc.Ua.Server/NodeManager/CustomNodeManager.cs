@@ -4138,6 +4138,24 @@ namespace Opc.Ua.Server
                     return StatusCodes.BadAggregateNotSupported;
                 }
 
+                // Part 13 §5.4.3.20: AnnotationCount counts Annotations, which are added with
+                // HistoryUpdate and never reach a MonitoredItem, so it cannot be calculated for one.
+                if (aggregateFilter.AggregateType == ObjectIds.AggregateFunction_AnnotationCount)
+                {
+                    return StatusCodes.BadAggregateNotSupported;
+                }
+
+                // Part 13 Table 50: the aggregate must support the data type of the variable.
+                if (handle.Node is BaseVariableState aggregatedVariable &&
+                    !AggregateManager.IsSupportedForDataType(
+                        aggregateFilter.AggregateType,
+                        aggregatedVariable.DataType,
+                        aggregatedVariable.ValueRank,
+                        context.TypeTable))
+                {
+                    return StatusCodes.BadAggregateNotSupported;
+                }
+
                 var revisedFilter = new ServerAggregateFilter
                 {
                     AggregateType = aggregateFilter.AggregateType,

@@ -130,14 +130,6 @@ namespace TestData
                 return StatusCodes.BadTooManyOperations;
             }
 
-            if (aggregateId == Opc.Ua.ObjectIds.AggregateFunction_AnnotationCount)
-            {
-                return ComputeAnnotationCount(
-                    details,
-                    annotationTimes ?? Array.Empty<DateTime>(),
-                    outputs);
-            }
-
             IAggregateCalculator calculator = server.AggregateManager.CreateCalculator(
                 aggregateId,
                 details.StartTime,
@@ -148,6 +140,16 @@ namespace TestData
             if (calculator == null)
             {
                 return StatusCodes.BadAggregateNotSupported;
+            }
+
+            // AnnotationCount counts the Annotations of the variable (Part 13 §5.4.3.20); the raw
+            // values decide where the data starts and ends (Table 68).
+            if (annotationTimes != null && calculator is AggregateCalculator aggregateCalculator)
+            {
+                foreach (DateTime timestamp in annotationTimes)
+                {
+                    aggregateCalculator.QueueAnnotation(timestamp);
+                }
             }
 
             bool isForward = details.StartTime < details.EndTime;
@@ -199,90 +201,6 @@ namespace TestData
             return outputs.Count > MaxBufferedOutputs
                 ? StatusCodes.BadTooManyOperations
                 : ServiceResult.Good;
-        }
-
-        private static ServiceResult ComputeAnnotationCount(
-            ReadProcessedDetails details,
-            IReadOnlyList<DateTime> annotationTimes,
-            List<DataValue> outputs)
-        {
-            bool isForward = details.StartTime < details.EndTime;
-            if (details.ProcessingInterval <= 0)
-            {
-                DateTime low = isForward ? details.StartTime : details.EndTime;
-                DateTime high = isForward ? details.EndTime : details.StartTime;
-                outputs.Add(CreateAnnotationCountValue(
-                    CountAnnotations(annotationTimes, low, high),
-                    details.StartTime));
-                return ServiceResult.Good;
-            }
-
-            TimeSpan interval = TimeSpan.FromMilliseconds(details.ProcessingInterval);
-            if (isForward)
-            {
-                for (DateTime start = details.StartTime;
-                    start < details.EndTime;
-                    start = start.Add(interval))
-                {
-                    DateTime end = start.Add(interval);
-                    if (end > details.EndTime)
-                    {
-                        end = details.EndTime;
-                    }
-
-                    outputs.Add(CreateAnnotationCountValue(
-                        CountAnnotations(annotationTimes, start, end),
-                        start));
-                }
-            }
-            else
-            {
-                for (DateTime start = details.StartTime;
-                    start > details.EndTime;
-                    start = start.Subtract(interval))
-                {
-                    DateTime end = start.Subtract(interval);
-                    if (end < details.EndTime)
-                    {
-                        end = details.EndTime;
-                    }
-
-                    outputs.Add(CreateAnnotationCountValue(
-                        CountAnnotations(annotationTimes, end, start),
-                        start));
-                }
-            }
-
-            return ServiceResult.Good;
-        }
-
-        private static int CountAnnotations(
-            IReadOnlyList<DateTime> annotationTimes,
-            DateTime lowInclusive,
-            DateTime highExclusive)
-        {
-            int count = 0;
-            for (int ii = 0; ii < annotationTimes.Count; ii++)
-            {
-                DateTime timestamp = annotationTimes[ii];
-                if (timestamp >= lowInclusive && timestamp < highExclusive)
-                {
-                    count++;
-                }
-            }
-
-            return count;
-        }
-
-        private static DataValue CreateAnnotationCountValue(int count, DateTime timestamp)
-        {
-            var value = new DataValue(
-                new Variant(count),
-                StatusCodes.Good,
-                timestamp,
-                timestamp);
-            value.StatusCode = value.StatusCode.SetAggregateBits(AggregateBits.Calculated);
-            return value;
         }
 
         private static AggregateConfiguration ResolveConfiguration(
